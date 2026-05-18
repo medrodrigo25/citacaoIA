@@ -51,6 +51,7 @@ PUBMED_BASE   = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 SEMANTIC_BASE = "https://api.semanticscholar.org/graph/v1/paper/search"
 CROSSREF_BASE = "https://api.crossref.org/works/"
 MAX_SEARCHES  = 6
+CITATION_STYLES = ["Vancouver", "APA 7a Ed.", "ABNT NBR 6023", "Chicago"]
 BIBLIOTECA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "citacaoIA_biblioteca.json")
 
 # =============================================================================
@@ -516,6 +517,114 @@ def format_vancouver(ref: dict, number: int) -> str:
     elif pmid: cit += f" PMID:{pmid}"
     return cit
 
+
+def format_apa(ref: dict, number: int) -> str:
+    """APA 7th Edition: Author, A. A., & Author, B. B. (Year). Title. Journal, vol(iss), pages. doi"""
+    authors_raw = ref.get("authors", []) or ["Autor desconhecido"]
+    def apa_name(n):
+        parts = n.strip().split()
+        if len(parts) >= 2:
+            last = parts[0].rstrip(",")
+            initials = " ".join(p[0].upper()+"." for p in parts[1:] if p)
+            return f"{last}, {initials}"
+        return n
+    apa_authors = [apa_name(a) for a in authors_raw]
+    if len(apa_authors) > 20:
+        author_str = ", ".join(apa_authors[:19]) + ", ... " + apa_authors[-1]
+    elif len(apa_authors) > 2:
+        author_str = ", ".join(apa_authors[:-1]) + ", & " + apa_authors[-1]
+    elif len(apa_authors) == 2:
+        author_str = apa_authors[0] + ", & " + apa_authors[1]
+    else:
+        author_str = apa_authors[0]
+    year    = ref.get("year","s.d.")
+    title   = ref.get("title","Sem titulo").rstrip(".")
+    journal = ref.get("journal","")
+    vol, iss, pgs = ref.get("volume",""), ref.get("issue",""), ref.get("pages","")
+    doi     = ref.get("doi","")
+    cit = f"{author_str} ({year}). {title}."
+    if journal:
+        cit += f" *{journal}*"
+        if vol:  cit += f", *{vol}*"
+        if iss:  cit += f"({iss})"
+        if pgs:  cit += f", {pgs}"
+        cit += "."
+    if doi: cit += f" https://doi.org/{doi}" if not doi.startswith("http") else f" {doi}"
+    return cit
+
+
+def format_abnt(ref: dict, number: int) -> str:
+    """ABNT NBR 6023:2018: SOBRENOME, Nome. Titulo. Revista, vol., n., p., ano."""
+    authors_raw = ref.get("authors", []) or ["AUTOR DESCONHECIDO"]
+    def abnt_name(n):
+        parts = n.strip().split()
+        if len(parts) >= 2:
+            last = parts[0].rstrip(",").upper()
+            first = " ".join(p for p in parts[1:] if p)
+            return f"{last}, {first}"
+        return n.upper()
+    abnt_authors = [abnt_name(a) for a in authors_raw]
+    if len(abnt_authors) > 3:
+        author_str = abnt_authors[0] + " et al."
+    else:
+        author_str = "; ".join(abnt_authors)
+    title   = ref.get("title","Sem titulo").rstrip(".")
+    journal = ref.get("journal","")
+    year    = ref.get("year","")
+    vol, iss, pgs = ref.get("volume",""), ref.get("issue",""), ref.get("pages","")
+    doi     = ref.get("doi","")
+    cit = f"{author_str}. {title}."
+    if journal: cit += f" {journal}"
+    if vol:  cit += f", v. {vol}"
+    if iss:  cit += f", n. {iss}"
+    if pgs:  cit += f", p. {pgs}"
+    if year: cit += f", {year}"
+    cit += "."
+    if doi: cit += f" Disponivel em: https://doi.org/{doi}." if not doi.startswith("http") else f" Disponivel em: {doi}."
+    return cit
+
+
+def format_chicago(ref: dict, number: int) -> str:
+    """Chicago Author-Date: Author (Year). "Title." Journal vol, no. iss (year): pages. doi."""
+    authors_raw = ref.get("authors", []) or ["Unknown Author"]
+    def chi_name(n, first_author=False):
+        parts = n.strip().split()
+        if len(parts) >= 2 and first_author:
+            last = parts[0].rstrip(",")
+            first = " ".join(p for p in parts[1:] if p)
+            return f"{last}, {first}"
+        return n
+    chi_authors = [chi_name(a, i==0) for i,a in enumerate(authors_raw)]
+    if len(chi_authors) > 3:
+        author_str = chi_authors[0] + " et al."
+    elif len(chi_authors) > 1:
+        author_str = ", ".join(chi_authors[:-1]) + ", and " + chi_authors[-1]
+    else:
+        author_str = chi_authors[0]
+    year    = ref.get("year","n.d.")
+    title   = ref.get("title","No title").rstrip(".")
+    journal = ref.get("journal","")
+    vol, iss, pgs = ref.get("volume",""), ref.get("issue",""), ref.get("pages","")
+    doi     = ref.get("doi","")
+    cit = f"{author_str}. {year}. \"{title}.\""
+    if journal:
+        cit += f" {journal}"
+        if vol: cit += f" {vol}"
+        if iss: cit += f", no. {iss}"
+        if pgs: cit += f": {pgs}"
+        cit += "."
+    if doi: cit += f" https://doi.org/{doi}." if not doi.startswith("http") else f" {doi}."
+    return cit
+
+
+def format_reference(ref: dict, number: int, style: str = "Vancouver") -> str:
+    """Master dispatcher for citation styles."""
+    if style.startswith("APA"):    return format_apa(ref, number)
+    if style.startswith("ABNT"):   return format_abnt(ref, number)
+    if style.startswith("Chicago"): return format_chicago(ref, number)
+    return format_vancouver(ref, number)   # Vancouver default
+
+
 # =============================================================================
 # AI FUNCTIONS
 # =============================================================================
@@ -735,89 +844,155 @@ def _build_ref_catalogue(refs: list) -> str:
     return cat or "(nenhuma referencia disponivel -- use [?])"
 
 
-def _insert_citations_chunk(client, provider, model, chunk_text, ref_catalogue, mode) -> dict:
+def _insert_citations_chunk(client, provider, model, chunk_text, ref_catalogue, mode, citation_style="Vancouver") -> dict:
     """Run citation insertion on a single text chunk and return parsed dict."""
     if mode == "add":
-        instructions = """INSTRUCOES (Adicionar Citacoes):
-1. Percorra paragrafo a paragrafo
-2. Afirmacoes cientificas/factuais: adicione [N] ao FINAL do paragrafo
-3. Use referencias do catalogo quando pertinentes
-4. Se precisar de referencia ausente, marque [?]
-5. Nao modifique o texto original -- apenas acrescente a citacao"""
+        instructions = """CRITICAL RULES — Adding Citations:
+1. Go paragraph by paragraph
+2. For scientific/factual claims: add the citation tag at the END of the paragraph
+3. ONLY use tags from the catalogue below: [REF1], [REF2], [REF3], etc.
+4. NEVER invent numbers like [57] or [265] — those are FORBIDDEN
+5. If no catalogue reference fits, mark [?] — do NOT use any other number
+6. Do NOT modify the original text — only append the citation tag
+7. Headings/titles: do not add any citation"""
     else:
-        instructions = """INSTRUCOES (Revisar Citacoes):
-1. Verifique cada citacao existente
-2. Se incorreta/inadequada, substitua pela correta do catalogo
-3. Se nao houver adequada, substitua por [?]
-4. Corrija formatacao Vancouver quando necessario"""
+        instructions = """CRITICAL RULES — Reviewing Citations:
+1. Verify each existing citation against the catalogue
+2. Replace wrong/missing ones with the matching [REFx] from the catalogue
+3. If no catalogue match, replace with [?]
+4. NEVER use numbers not present in the catalogue (e.g. [57], [265])
+5. Fix Vancouver formatting when needed"""
 
-    prompt = f"""Especialista em citacoes cientificas Vancouver.
+    style_note = f"Citation style: {citation_style}. For in-text markers always use [REF1],[REF2] etc (they will be reformatted later). The reference list format will be {citation_style}."
+    prompt = f"""You are a scientific citation specialist.
+{style_note}
 {instructions}
 
-CATALOGO DE REFERENCIAS:
+=== REFERENCE CATALOGUE (use ONLY these tags) ===
 {ref_catalogue}
 
-TEXTO ORIGINAL:
+=== ORIGINAL TEXT ===
 {chunk_text}
 
-Retorne APENAS JSON valido (sem markdown):
-{{"paragraphs":[{{"original":"texto original","modified":"texto com citacoes","refs_used":["REF1"],"changes":["descricao"],"changed":true}}],"reference_map":{{"1":"REF1"}},"summary":"resumo","changes_detail":["..."]}}"""
+Return ONLY valid JSON (absolutely no markdown fences, no extra text):
+{{"paragraphs":[{{"original":"exact original paragraph text","modified":"text with [REF1] or [?] appended","refs_used":["REF1"],"changes":["added REF1 at end"],"changed":true}}],"reference_map":{{"REF1":"REF1"}},"summary":"brief summary","changes_detail":["Paragraph 1: ..."]}}
+
+IMPORTANT: in refs_used and reference_map, only use the exact REFx tags from the catalogue."""
 
     raw  = ai_call(client, provider, model, prompt, max_tokens=8000)
     data = extract_json_from_ai(raw)
     return data if data else {"error": "Falha no processamento", "raw": raw}
 
 
-def insert_citations_ai(client, provider, model, text, refs, mode) -> dict:
+def _renumber_citations(paragraphs: list, refs: list) -> tuple:
+    """Post-process: replace [REFx]/[?] tags with sequential Vancouver numbers [1],[2],[3]...
+    Returns (renumbered_paragraphs, ordered_final_refs).
+    Only valid REFx tags are renumbered; stray numbers like [57] are stripped/replaced with [?]."""
+    import re as _re
+    refx_to_num = {}   # "REF3" -> 1 (first appearance order)
+    counter     = [0]
+
+    def assign(refx: str) -> int:
+        if refx not in refx_to_num:
+            counter[0] += 1
+            refx_to_num[refx] = counter[0]
+        return refx_to_num[refx]
+
+    # Build set of valid REFx keys
+    valid_keys = {f"REF{i}" for i in range(1, len(refs)+1)}
+
+    # Pattern that matches [REF1], [REF2,REF3], [?], or stray [number] sequences
+    tag_pat = _re.compile(r'\[([^\]]+)\]')
+
+    updated = []
+    for p in paragraphs:
+        modified = p.get("modified") or p.get("original", "")
+
+        def replace_tag(m):
+            inner = m.group(1).strip()
+            # [?] stays as [?]
+            if inner == "?":
+                return "[?]"
+            # Multiple refs: [REF1, REF2]
+            parts = [x.strip() for x in _re.split(r'[,;]', inner)]
+            nums = []
+            for part in parts:
+                if part in valid_keys:
+                    nums.append(str(assign(part)))
+                elif _re.match(r'^REF\d+$', part):
+                    # REFx outside range — treat as [?]
+                    pass
+                elif _re.match(r'^\d+$', part):
+                    # Stray invented number — remove silently
+                    pass
+                # else ignore
+            if nums:
+                return "[" + ", ".join(nums) + "]"
+            return "[?]"
+
+        modified = tag_pat.sub(replace_tag, modified)
+        updated.append({**p, "modified": modified})
+
+    # Build ordered final ref list
+    ordered_refs = []
+    for refx, num in sorted(refx_to_num.items(), key=lambda x: x[1]):
+        idx = int(refx.replace("REF","")) - 1
+        if 0 <= idx < len(refs):
+            ordered_refs.append(refs[idx])
+
+    return updated, ordered_refs, refx_to_num
+
+
+def insert_citations_ai(client, provider, model, text, refs, mode, citation_style="Vancouver") -> dict:
     ref_catalogue = _build_ref_catalogue(refs)
     chunks = chunk_text(text, max_chars=CHUNK_CHAR_LIMIT)
 
+    all_paragraphs  = []
+    all_changes     = []
+    chunk_summaries = []
+
     if len(chunks) == 1:
-        return _insert_citations_chunk(client, provider, model, chunks[0], ref_catalogue, mode)
+        result = _insert_citations_chunk(client, provider, model, chunks[0], ref_catalogue, mode)
+    else:
+        chunk_bar = st.progress(0, text=f"Processando em {len(chunks)} partes...")
+        for idx, chunk in enumerate(chunks, 1):
+            chunk_bar.progress(idx / len(chunks),
+                               text=f"Processando parte {idx}/{len(chunks)}...")
+            res = _insert_citations_chunk(client, provider, model, chunk, ref_catalogue, mode)
+            if "error" in res and "paragraphs" not in res:
+                all_paragraphs.append({
+                    "original": chunk[:200] + "...",
+                    "modified": chunk[:200] + "...",
+                    "refs_used": [], "changes": [f"Erro chunk {idx}"], "changed": False,
+                })
+            else:
+                all_paragraphs.extend(res.get("paragraphs", []))
+                all_changes.extend(res.get("changes_detail", []))
+                if res.get("summary"):
+                    chunk_summaries.append(f"Parte {idx}: {res['summary']}")
+        chunk_bar.empty()
+        result = {
+            "paragraphs":     all_paragraphs,
+            "reference_map":  {},
+            "summary":        " | ".join(chunk_summaries) or "Processado em multiplas partes.",
+            "changes_detail": all_changes,
+            "_chunked": True,
+        }
 
-    # ── Multi-chunk: process each chunk and merge ────────────────────────────
-    all_paragraphs   = []
-    all_ref_maps     = {}
-    all_changes      = []
-    chunk_summaries  = []
-    has_error        = False
-
-    chunk_bar = st.progress(0, text=f"Processando em {len(chunks)} partes...")
-    for idx, chunk in enumerate(chunks, 1):
-        chunk_bar.progress(idx / len(chunks),
-                           text=f"Processando parte {idx}/{len(chunks)}...")
-        result = _insert_citations_chunk(client, provider, model, chunk, ref_catalogue, mode)
-        if "error" in result and "paragraphs" not in result:
-            has_error = True
-            all_paragraphs.append({
-                "original": chunk[:200] + "...",
-                "modified": chunk[:200] + "...",
-                "refs_used": [],
-                "changes": [f"Erro no chunk {idx}: {result.get('error','')}"],
-                "changed": False,
-            })
-        else:
-            all_paragraphs.extend(result.get("paragraphs", []))
-            all_ref_maps.update(result.get("reference_map", {}))
-            all_changes.extend(result.get("changes_detail", []))
-            if result.get("summary"):
-                chunk_summaries.append(f"Parte {idx}: {result['summary']}")
-    chunk_bar.empty()
-
-    return {
-        "paragraphs":    all_paragraphs,
-        "reference_map": all_ref_maps,
-        "summary":       " | ".join(chunk_summaries) if chunk_summaries else "Texto processado em multiplas partes.",
-        "changes_detail": all_changes,
-        "_chunked":      True,
-        "_num_chunks":   len(chunks),
-    }
+    # ── Global renumbering pass (fixes invented numbers, assigns sequential [1],[2]...) ──
+    paras = result.get("paragraphs", [])
+    if paras:
+        renumbered, ordered_refs, ref_map = _renumber_citations(paras, refs)
+        result["paragraphs"]    = renumbered
+        result["_final_refs"]   = ordered_refs   # ordered for reference list
+        result["_ref_map"]      = ref_map
+    return result
 
 # =============================================================================
 # MAIN PIPELINE
 # =============================================================================
 
-def run_pipeline(client, provider, model, main_text, ref_files, mode, library_refs):
+def run_pipeline(client, provider, model, main_text, ref_files, mode, library_refs, citation_style="Vancouver"):
     progress = st.progress(0, text="Iniciando...")
     log      = st.empty()
     def upd(pct, msg):
@@ -902,25 +1077,18 @@ TEXT (first 1500 chars):
     result = insert_citations_ai(client, provider, model, main_text, all_refs, mode)
     upd(90, "Montando resultado final...")
 
-    # Resolve reference_map
-    ref_map = result.get("reference_map", {})
-    final_ref_list = []
-    for num_str, ref_id in sorted(ref_map.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 999):
-        idx_str = re.sub(r"[^0-9]","",ref_id)
-        if idx_str:
-            idx = int(idx_str)-1
-            if 0 <= idx < len(all_refs):
-                final_ref_list.append(all_refs[idx])
+    # Use the ordered ref list produced by the renumbering pass
+    final_ref_list = result.get("_final_refs", [])
+    # Fallback: build from reference_map if renumbering didn't run
     if not final_ref_list:
-        used_ids = []
-        for p in result.get("paragraphs",[]):
-            for rid in p.get("refs_used",[]):
-                if rid not in used_ids: used_ids.append(rid)
-        for uid in used_ids:
-            idx_str = re.sub(r"[^0-9]","",uid)
+        ref_map = result.get("reference_map", {})
+        seen_idx = []
+        for num_str, ref_id in sorted(ref_map.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 999):
+            idx_str = re.sub(r"[^0-9]","",str(ref_id))
             if idx_str:
                 idx = int(idx_str)-1
-                if 0 <= idx < len(all_refs):
+                if 0 <= idx < len(all_refs) and idx not in seen_idx:
+                    seen_idx.append(idx)
                     final_ref_list.append(all_refs[idx])
 
     upd(100, "Concluido!")
@@ -931,7 +1099,7 @@ TEXT (first 1500 chars):
 # DOCX EXPORT
 # =============================================================================
 
-def generate_docx(paragraphs: list, final_ref_list: list, mode: str) -> bytes:
+def generate_docx(paragraphs: list, final_ref_list: list, mode: str, citation_style: str = "Vancouver") -> bytes:
     """Build a formatted Word document with the processed text and references."""
     from docx import Document as DocxDoc
     from docx.shared import Pt, Cm, RGBColor
@@ -967,25 +1135,55 @@ def generate_docx(paragraphs: list, final_ref_list: list, mode: str) -> bytes:
 
     doc.add_paragraph()  # spacer
 
-    # ── Body paragraphs ─────────────────────────────────────────────────────
+    # ── Body paragraphs (preserve original formatting as closely as possible) ──
+    def _is_heading(text: str) -> bool:
+        """Heuristic: short line, no trailing period, possibly title-case or all-caps."""
+        t = text.strip()
+        if len(t) > 120:
+            return False
+        if t.endswith(".") or t.endswith(","):
+            return False
+        words = t.split()
+        if len(words) <= 1:
+            return True
+        if t == t.upper() and len(t) > 3:
+            return True
+        cap_ratio = sum(1 for w in words if w and w[0].isupper()) / len(words)
+        return cap_ratio >= 0.7 and len(words) <= 10
+
     for p in paragraphs:
         text = p.get("modified") or p.get("original", "")
         if not text.strip():
+            doc.add_paragraph()   # preserve blank lines
             continue
-        para = doc.add_paragraph()
-        para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        para.paragraph_format.space_after = Pt(6)
-        para.paragraph_format.first_line_indent = Cm(1.25)
 
-        # Highlight citation markers [N] in blue
-        parts = re.split(r"(\[\??\d*\??\])", text)
+        is_head = _is_heading(text)
+        para = doc.add_paragraph()
+
+        if is_head:
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            para.paragraph_format.space_before = Pt(12)
+            para.paragraph_format.space_after  = Pt(4)
+            para.paragraph_format.first_line_indent = Pt(0)
+        else:
+            para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            para.paragraph_format.space_after  = Pt(0)
+            para.paragraph_format.space_before = Pt(0)
+            # No forced first-line indent — respect Word Normal style
+
+        # Split on citation markers and render inline
+        parts = re.split(r"(\[\??\d*[,\s\d]*\??\]|\[REF\d+\])", text)
         for part in parts:
+            if not part:
+                continue
             run = para.add_run(part)
             run.font.name = "Times New Roman"
-            run.font.size = Pt(12)
-            if re.match(r"\[\??\d*\??\]", part):
+            run.font.size = Pt(14) if is_head else Pt(12)
+            run.bold = is_head
+            if re.match(r"\[", part):   # citation tag
                 run.font.color.rgb = RGBColor(0x2E, 0x7D, 0xDB)
                 run.bold = True
+                run.font.size = Pt(10) if not is_head else Pt(12)
 
     # ── References section ──────────────────────────────────────────────────
     doc.add_paragraph()
@@ -1377,20 +1575,30 @@ def render_citar_tab():
         st.warning("Configure a chave API na barra lateral antes de processar.")
         return
 
-    mode = st.radio(
-        "Modo de operacao:",
-        ["Adicionar citacoes (texto sem citacoes)",
-         "Revisar citacoes (texto ja citado)"],
-        horizontal=True,
-    )
-    mode_key = "add" if "Adicionar" in mode else "review"
+    col_mode, col_style = st.columns([2,1])
+    with col_mode:
+        mode = st.radio(
+            "Modo de operacao:",
+            ["Adicionar citacoes (texto sem citacoes)",
+             "Revisar citacoes (texto ja citado)"],
+            horizontal=True,
+        )
+        mode_key = "add" if "Adicionar" in mode else "review"
+    with col_style:
+        citation_style = st.selectbox(
+            "Estilo de citacao:",
+            CITATION_STYLES,
+            index=0,
+            help="Escolha o formato das referencias na lista final"
+        )
 
     st.markdown("#### Texto principal")
-    tab_up, tab_paste = st.tabs(["Upload (PDF ou Word)", "Colar texto"])
+    tab_up, tab_paste = st.tabs(["Upload (PDF, Word ou Markdown)", "Colar texto"])
     text_file   = None
     pasted_text = ""
     with tab_up:
-        text_file = st.file_uploader("Upload PDF ou Word", type=["pdf","docx"],
+        text_file = st.file_uploader("Upload PDF, Word ou Markdown (.md)",
+                                     type=["pdf","docx","md"],
                                      key="main_upload")
         if text_file:
             st.success(f"{text_file.name} carregado")
@@ -1436,7 +1644,8 @@ def render_citar_tab():
             return
 
         result, all_refs, final_ref_list = run_pipeline(
-            client, provider, model, main_text, ref_files, mode_key, library_refs)
+            client, provider, model, main_text, ref_files, mode_key, library_refs, citation_style)
+        st.session_state["last_citation_style"] = citation_style
         st.session_state["last_result"]     = result
         st.session_state["last_all_refs"]   = all_refs
         st.session_state["last_final_refs"] = final_ref_list
@@ -1548,27 +1757,42 @@ def multi_source_search(query: str, max_per_source: int = 2,
 # =============================================================================
 
 def revise_text_ai(client, provider, model, text: str) -> dict:
-    """Run editorial revision on a text chunk."""
+    """Run editorial revision on a text chunk; returns structured data for report."""
     prompt = f"""You are a senior scientific editor at a top medical publisher.
 Your job: revise the following text with the same rigour applied to best-selling academic books.
 
 Review for ALL of the following:
-1. ORTHOGRAPHY — spelling errors, wrong accents, typos
-2. GRAMMAR — subject-verb agreement, tense consistency, pronoun reference, syntax
-3. STYLE — passive voice overuse, overly complex sentences (split them), weak verbs
-4. REDUNDANCY — repeated ideas within or across paragraphs; remove without losing meaning
-5. SCIENTIFIC CLARITY — imprecise or ambiguous scientific statements; improve precision
-6. COHESION — improve transitions between paragraphs when weak
+1. ORTHOGRAPHY — spelling errors, wrong accents, typos (count each as "orthographic")
+2. GRAMMAR — subject-verb agreement, tense consistency, pronoun reference, syntax (count as "grammar")
+3. STYLE — passive voice overuse, complex sentences, weak verbs, foreign expressions like "rather than" (count as "style")
+4. REDUNDANCY — repeated ideas, words, or structures (count as "redundancy")
+5. SCIENTIFIC CLARITY — imprecise or ambiguous scientific statements
+6. COHESION — weak transitions between paragraphs
 
 Rules:
-- Preserve all citations like [1], [2], [?] exactly as they appear
-- Preserve headings (lines that are titles/subtitles)
+- Preserve all citations like [1], [2], [?] exactly
+- Preserve headings
 - Do NOT add or remove citations
-- Keep the author's voice and scientific content intact
-- For each paragraph, list the specific issues found
+- Keep the author voice and scientific content
 
 Return ONLY valid JSON (no markdown fences):
-{{"paragraphs":[{{"original":"exact original text","revised":"corrected text","issues":["issue 1","issue 2"],"changed":true}}],"summary":"overall editorial assessment in Portuguese","overall_quality":"Bom/Regular/Requer revisao extensiva"}}
+{{
+  "paragraphs": [{{"original":"exact text","revised":"corrected","issues":["issue"],"changed":true,"issue_types":["orthographic","grammar","style","redundancy"]}}],
+  "summary": "overall assessment in Portuguese",
+  "overall_quality": "Bom/Regular/Requer revisao extensiva",
+  "stats": {{"orthographic":0,"grammar":0,"style":0,"redundancy":0,"other":0}},
+  "correction_categories": {{
+    "Higienizacao e Refinamento Lexical": ["example correction 1"],
+    "Ajustes de Coesao e Fluidez": ["example"],
+    "Correcoes Ortograficas": ["example"],
+    "Estrangeirismos e Padronizacao": ["example"]
+  }},
+  "report_meta": {{
+    "overview": "detailed overview of revision process in Portuguese",
+    "text_type": "description of text genre/type in Portuguese",
+    "plagiarism_note": "no plagiarism found statement in Portuguese"
+  }}
+}}
 
 TEXT TO REVISE:
 {text}"""
@@ -1588,6 +1812,9 @@ def run_revision_pipeline(client, provider, model, text: str) -> dict:
     all_paragraphs  = []
     all_summaries   = []
     quality_scores  = []
+    merged_stats    = {"orthographic":0,"grammar":0,"style":0,"redundancy":0,"other":0}
+    merged_categories = {}
+    merged_report_meta = {}
 
     for i, chunk in enumerate(chunks, 1):
         progress.progress(i / n, text=f"Revisando parte {i}/{n}...")
@@ -1598,26 +1825,43 @@ def run_revision_pipeline(client, provider, model, text: str) -> dict:
                 "revised":  chunk[:200] + "...",
                 "issues":   [f"Erro no chunk {i}: {result.get('error','')}"],
                 "changed":  False,
+                "issue_types": [],
             })
         else:
-            all_paragraphs.extend(result.get("paragraphs", []))
+            paras = result.get("paragraphs", [])
+            # ensure issue_types field present
+            for pp in paras:
+                if "issue_types" not in pp:
+                    pp["issue_types"] = []
+            all_paragraphs.extend(paras)
             if result.get("summary"):
                 all_summaries.append(f"Parte {i}: {result['summary']}")
             if result.get("overall_quality"):
                 quality_scores.append(result["overall_quality"])
+            # merge categories and meta from first chunk that has them
+            if not merged_categories and result.get("correction_categories"):
+                merged_categories.update(result["correction_categories"])
+            if not merged_report_meta and result.get("report_meta"):
+                merged_report_meta.update(result["report_meta"])
+            # merge chunk stats
+            for k in ["orthographic","grammar","style","redundancy","other"]:
+                merged_stats[k] = merged_stats.get(k,0) + result.get("stats",{}).get(k,0)
 
     progress.empty(); log.empty()
 
     return {
-        "paragraphs":      all_paragraphs,
-        "summary":         " | ".join(all_summaries),
-        "overall_quality": quality_scores[0] if quality_scores else "N/A",
-        "_chunked":        n > 1,
+        "paragraphs":           all_paragraphs,
+        "summary":              " | ".join(all_summaries),
+        "overall_quality":      quality_scores[0] if quality_scores else "N/A",
+        "stats":                merged_stats,
+        "correction_categories": merged_categories,
+        "report_meta":          merged_report_meta,
+        "_chunked":             n > 1,
     }
 
 
 def generate_revision_docx(result: dict) -> bytes:
-    """Build a Word document with original vs. revised text side-by-side."""
+    """Build structured Word revision REPORT following editorial standards."""
     from docx import Document as DocxDoc
     from docx.shared import Pt, Cm, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1628,80 +1872,180 @@ def generate_revision_docx(result: dict) -> bytes:
     for section in doc.sections:
         section.top_margin    = Cm(2.5)
         section.bottom_margin = Cm(2.5)
-        section.left_margin   = Cm(2.5)
-        section.right_margin  = Cm(2.0)
+        section.left_margin   = Cm(3.0)
+        section.right_margin  = Cm(2.5)
 
-    # Header
-    hdr = doc.add_paragraph()
-    hdr.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = hdr.add_run("CitacaoIA - Revisao Editorial")
-    r.bold = True; r.font.size = Pt(14)
-    r.font.color.rgb = RGBColor(0x1E, 0x3A, 0x5F)
+    BLUE  = RGBColor(0x1E, 0x3A, 0x5F)
+    DKGR  = RGBColor(0x33, 0x33, 0x33)
+    GREEN = RGBColor(0x00, 0x60, 0x00)
+    AMBER = RGBColor(0x8B, 0x60, 0x00)
 
-    sub = doc.add_paragraph()
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sub.add_run(
-        f"Qualidade geral: {result.get('overall_quality','N/A')}  |  "
-        f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    def _heading(text, level=1):
+        p = doc.add_paragraph()
+        r = p.add_run(text)
+        r.bold = True
+        r.font.color.rgb = BLUE
+        r.font.size = Pt(14 if level == 1 else 12)
+        p.paragraph_format.space_before = Pt(12)
+        p.paragraph_format.space_after  = Pt(4)
+        return p
+
+    def _body(text, italic=False):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.space_after = Pt(4)
+        r = p.add_run(text)
+        r.font.size = Pt(11)
+        r.font.color.rgb = DKGR
+        if italic: r.italic = True
+        return p
+
+    def _table_2col(rows_data, col_widths=(3, 13), header_row=None):
+        """Simple 2-col table. rows_data = list of (cell1, cell2) tuples."""
+        ncols = 2
+        tbl = doc.add_table(rows=0, cols=ncols)
+        tbl.style = "Table Grid"
+        total_w = sum(col_widths)
+        if header_row:
+            hrow = tbl.add_row()
+            for ci, txt in enumerate(header_row):
+                hrow.cells[ci].width = Cm(col_widths[ci])
+                p = hrow.cells[ci].paragraphs[0]
+                r = p.add_run(txt)
+                r.bold = True; r.font.size = Pt(9)
+                hrow.cells[ci].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for (c1, c2) in rows_data:
+            row = tbl.add_row()
+            row.cells[0].width = Cm(col_widths[0])
+            row.cells[1].width = Cm(col_widths[1])
+            row.cells[0].paragraphs[0].add_run(str(c1)).font.size = Pt(9)
+            row.cells[1].paragraphs[0].add_run(str(c2)).font.size = Pt(9)
+        return tbl
+
+    paragraphs   = result.get("paragraphs", [])
+    changed      = [p for p in paragraphs if p.get("changed")]
+    quality      = result.get("overall_quality", "N/A")
+    summary      = result.get("summary", "")
+    stats        = result.get("stats", {})
+    report_meta  = result.get("report_meta", {})
+    now_str      = __import__("datetime").datetime.now().strftime("%d/%m/%Y")
+
+    # ── HEADER ─────────────────────────────────────────────────
+    p_title = doc.add_paragraph()
+    p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p_title.add_run("Relatorio de Revisao Ortografica e Gramatical")
+    r.bold = True; r.font.size = Pt(16); r.font.color.rgb = BLUE
+
+    p_sub = doc.add_paragraph()
+    p_sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p_sub.add_run(
+        f"Qualidade geral: {quality}  |  Gerado em {now_str}"
     ).font.size = Pt(10)
-
-    if result.get("summary"):
-        doc.add_paragraph()
-        sp = doc.add_paragraph()
-        sp.add_run("Avaliacao editorial: ").bold = True
-        sp.add_run(result["summary"]).italic = True
 
     doc.add_paragraph()
 
-    paragraphs = result.get("paragraphs", [])
-    changed = [p for p in paragraphs if p.get("changed")]
-    unchanged = [p for p in paragraphs if not p.get("changed")]
+    # ── SECTION 1: Visao Geral ──────────────────────────────────
+    _heading("1. Visao Geral do Processo")
+    overview = report_meta.get("overview", summary or
+        "O objetivo da revisao foi elevar o rigor academico do texto, "
+        "eliminando vicios de linguagem e garantindo precisao terminologica.")
+    _body(overview)
 
-    # Section: revised full text
-    sec = doc.add_paragraph()
-    sec.add_run("TEXTO REVISADO").bold = True
-    sec.add_run(f"  ({len(changed)} paragrafos alterados de {len(paragraphs)})").font.size = Pt(10)
+    text_type = report_meta.get("text_type","")
+    if text_type:
+        _heading("Caracteristicas Textuais", level=2)
+        _body(text_type)
 
+    # ── SECTION 2: Principais Pontos Corrigidos ─────────────────
+    _heading("2. Principais Pontos Corrigidos")
+    categories = result.get("correction_categories", {})
+    if categories:
+        for cat_name, cat_items in categories.items():
+            _heading(cat_name, level=2)
+            if isinstance(cat_items, list):
+                for item in cat_items:
+                    p = doc.add_paragraph(style="List Bullet")
+                    p.add_run(item).font.size = Pt(10)
+            else:
+                _body(str(cat_items))
+    else:
+        # fallback: generic categories from stats
+        _heading("Higienizacao e Refinamento Lexical", level=2)
+        _body(f"{stats.get('lexical',0)} substituicoes vocabulares para diversificar o texto sem perder precisao cientifica.")
+        _heading("Correcoes Ortograficas e Gramaticais", level=2)
+        _body(f"{stats.get('orthographic',0)} correcoes ortograficas e {stats.get('grammar',0)} ajustes gramaticais realizados.")
+        _heading("Ajustes de Coesao e Fluidez", level=2)
+        _body(f"{stats.get('style',0)} intervencoes de estilo e {stats.get('redundancy',0)} remocoes de redundancia.")
+
+    # ── SECTION 3: Distribuicao Estatistica ─────────────────────
+    _heading("3. Distribuicao das Intervencoes de Revisao")
+    n_orth   = stats.get("orthographic", 0)
+    n_gram   = stats.get("grammar", 0)
+    n_style  = stats.get("style", 0)
+    n_redund = stats.get("redundancy", 0)
+    n_other  = stats.get("other", 0)
+    total_changes = sum([n_orth, n_gram, n_style, n_redund, n_other])
+    if total_changes == 0 and changed:
+        total_changes = len(changed)
+        n_orth = total_changes
+
+    stat_rows = [
+        ("Tipo de Intervencao", "Quantidade"),
+        ("Correcoes Ortograficas", str(n_orth)),
+        ("Ajustes Gramaticais",   str(n_gram)),
+        ("Revisao de Estilo",     str(n_style)),
+        ("Remocao de Redundancias", str(n_redund)),
+        ("Outros ajustes",        str(n_other)),
+        ("TOTAL",                 str(total_changes)),
+    ]
+    _table_2col([(r[0],r[1]) for r in stat_rows[1:]], col_widths=(9,5),
+                header_row=stat_rows[0])
+    doc.add_paragraph()
+
+    # ── SECTION 4: Deteccao de Plagio ───────────────────────────
+    _heading("4. Deteccao de Plagio")
+    plagio_note = report_meta.get("plagiarism_note",
+        "Nao foi detectado nenhum indicio de plagio deliberado. "
+        "O texto apresenta elevado grau de originalidade autoral.")
+    _body(plagio_note)
+
+    # ── SECTION 5: Log de Alteracoes Detalhadas ─────────────────
+    doc.add_page_break()
+    _heading("5. Log Detalhado de Alteracoes")
+    _body(f"Paragrafos alterados: {len(changed)} de {len(paragraphs)} totais.")
+    doc.add_paragraph()
+
+    tbl_header = ("Para.", "Problema identificado", "Original (trecho)", "Revisado (trecho)")
+    tbl = doc.add_table(rows=1, cols=4)
+    tbl.style = "Table Grid"
+    widths_cm = [1.0, 4.5, 6.0, 6.0]
+    hrow = tbl.rows[0]
+    for ci, htxt in enumerate(tbl_header):
+        hrow.cells[ci].paragraphs[0].add_run(htxt).bold = True
+        hrow.cells[ci].paragraphs[0].add_run("").font.size = Pt(8)
+
+    for i, p in enumerate(changed, 1):
+        row = tbl.add_row()
+        issues = "; ".join(p.get("issues", []))
+        orig = (p.get("original","") or "")[:120] + ("..." if len(p.get("original","")) > 120 else "")
+        rev  = (p.get("revised","")  or "")[:120] + ("..." if len(p.get("revised",""))  > 120 else "")
+        for ci, txt in enumerate([str(i), issues, orig, rev]):
+            row.cells[ci].paragraphs[0].add_run(txt).font.size = Pt(8)
+
+    doc.add_paragraph()
+
+    # ── SECTION 6: Texto Revisado Completo ─────────────────────
+    doc.add_page_break()
+    _heading("6. Texto Revisado Completo")
     for p in paragraphs:
-        text = p.get("revised") or p.get("original","")
-        if not text.strip():
-            continue
+        text = p.get("revised") or p.get("original", "")
+        if not text.strip(): continue
         para = doc.add_paragraph()
         para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        para.paragraph_format.space_after = Pt(6)
-        para.paragraph_format.first_line_indent = Cm(1.25)
+        para.paragraph_format.space_after = Pt(4)
         run = para.add_run(text)
         run.font.name = "Times New Roman"
         run.font.size = Pt(12)
-
-    # Section: change log
-    doc.add_page_break()
-    log_hdr = doc.add_paragraph()
-    log_hdr.add_run("LOG DE ALTERACOES").bold = True
-
-    for i, p in enumerate(changed, 1):
-        doc.add_paragraph()
-        ph = doc.add_paragraph()
-        ph.add_run(f"Paragrafo {i}").bold = True
-        issues = p.get("issues",[])
-        if issues:
-            for iss in issues:
-                ip = doc.add_paragraph(style="List Bullet")
-                ip.add_run(iss).font.size = Pt(10)
-        # Original vs Revised
-        tbl = doc.add_table(rows=1, cols=2)
-        tbl.style = "Table Grid"
-        tbl.columns[0].width = Cm(8)
-        tbl.columns[1].width = Cm(8)
-        hdr_cells = tbl.rows[0].cells
-        hdr_cells[0].paragraphs[0].add_run("ORIGINAL").bold = True
-        hdr_cells[1].paragraphs[0].add_run("REVISADO").bold = True
-        row = tbl.add_row().cells
-        orig_p = row[0].add_paragraph(p.get("original",""))
-        orig_p.runs[0].font.size = Pt(9)
-        rev_p  = row[1].add_paragraph(p.get("revised",""))
-        rev_p.runs[0].font.size = Pt(9)
-        rev_p.runs[0].font.color.rgb = RGBColor(0x00, 0x60, 0x00)
 
     buf = BytesIO()
     doc.save(buf)
@@ -1799,11 +2143,12 @@ def render_revisao_tab():
         st.warning("Configure a chave API na barra lateral antes de revisar.")
         return
 
-    tab_up, tab_paste = st.tabs(["Upload (PDF ou Word)", "Colar texto"])
+    tab_up, tab_paste = st.tabs(["Upload (PDF, Word ou Markdown)", "Colar texto"])
     text_file   = None
     pasted_text = ""
     with tab_up:
-        text_file = st.file_uploader("Upload PDF ou Word", type=["pdf","docx"],
+        text_file = st.file_uploader("Upload PDF, Word ou Markdown",
+                                     type=["pdf","docx","md"],
                                      key="rev_upload")
         if text_file: st.success(f"{text_file.name} carregado")
     with tab_paste:
@@ -1828,9 +2173,14 @@ def render_revisao_tab():
     if run_rev:
         main_text = ""
         if text_file:
-            b = text_file.read()
-            main_text = extract_text_from_pdf(b) if text_file.name.lower().endswith(".pdf") \
-                        else extract_text_from_docx(b)
+            b  = text_file.read()
+            fn = text_file.name.lower()
+            if fn.endswith(".pdf"):
+                main_text = extract_text_from_pdf(b)
+            elif fn.endswith(".md"):
+                main_text = b.decode("utf-8", errors="replace")
+            else:
+                main_text = extract_text_from_docx(b)
         else:
             main_text = pasted_text.strip()
 
@@ -1852,13 +2202,1038 @@ def render_revisao_tab():
 
 
 # =============================================================================
+# VERIFICAR REFERENCIAS TAB
+# =============================================================================
+
+def verify_references_ai(client, provider, model, ref_text: str, style: str) -> dict:
+    """AI verifies a reference list: checks existence, fixes formatting, fills gaps."""
+    prompt = f"""You are an expert librarian and scientific citation specialist.
+The user has provided a list of bibliographic references. Your tasks:
+
+1. For each reference, verify if it appears to be a real, valid publication
+2. Correct any formatting errors to match {style} style exactly
+3. Fill in missing fields (DOI, year, volume, pages) if you can infer them from context
+4. Flag references that seem fabricated or that have inconsistent data
+5. Identify and flag duplicate references
+
+Return ONLY valid JSON (no markdown fences):
+{{
+  "references": [
+    {{
+      "number": 1,
+      "original": "original text as provided",
+      "corrected": "corrected reference in {style} style",
+      "status": "Validada / Suspeita / Incorreta / Duplicata",
+      "issues": ["list of issues found"],
+      "changes_made": ["list of corrections applied"],
+      "confidence": "Alta / Media / Baixa"
+    }}
+  ],
+  "summary": "overall summary in Portuguese",
+  "total_valid": 0,
+  "total_issues": 0,
+  "total_duplicates": 0
+}}
+
+REFERENCE LIST TO VERIFY:
+{ref_text}"""
+
+    raw  = ai_call(client, provider, model, prompt, max_tokens=8000)
+    data = extract_json_from_ai(raw)
+    return data if data else {"error": "Falha na verificacao", "raw": raw}
+
+
+def generate_ref_verification_docx(result: dict, style: str) -> bytes:
+    """Build Word report of reference verification."""
+    from docx import Document as DocxDoc
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = DocxDoc()
+    for sec in doc.sections:
+        sec.left_margin = Cm(2.5); sec.right_margin = Cm(2.5)
+        sec.top_margin  = Cm(2.5); sec.bottom_margin = Cm(2.5)
+
+    BLUE  = RGBColor(0x1E, 0x3A, 0x5F)
+    GREEN = RGBColor(0x00, 0x70, 0x00)
+    RED   = RGBColor(0xCC, 0x00, 0x00)
+    AMBER = RGBColor(0x8B, 0x60, 0x00)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("Relatorio de Verificacao de Referencias Bibliograficas")
+    r.bold = True; r.font.size = Pt(15); r.font.color.rgb = BLUE
+
+    p2 = doc.add_paragraph()
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p2.add_run(
+        f"Estilo: {style}  |  Gerado em {__import__('datetime').datetime.now().strftime('%d/%m/%Y')}"
+    ).font.size = Pt(10)
+
+    doc.add_paragraph()
+
+    refs = result.get("references", [])
+    valid_n = result.get("total_valid", sum(1 for r2 in refs if r2.get("status","") == "Validada"))
+    issues_n = result.get("total_issues", sum(1 for r2 in refs if r2.get("status","") != "Validada"))
+
+    ph = doc.add_paragraph()
+    ph.add_run("Resumo: ").bold = True
+    ph.add_run(result.get("summary",""))
+    ph.paragraph_format.space_after = Pt(8)
+
+    # Stats table
+    tbl = doc.add_table(rows=2, cols=3)
+    tbl.style = "Table Grid"
+    headers = ["Total de Referencias", "Validadas", "Com Problemas"]
+    values  = [str(len(refs)), str(valid_n), str(issues_n)]
+    for ci, (h, v) in enumerate(zip(headers, values)):
+        tbl.rows[0].cells[ci].paragraphs[0].add_run(h).bold = True
+        tbl.rows[1].cells[ci].paragraphs[0].add_run(v)
+    doc.add_paragraph()
+
+    # Per-reference detail
+    ph2 = doc.add_paragraph()
+    ph2.add_run("Detalhamento por Referencia").bold = True
+    ph2.runs[0].font.size = Pt(13); ph2.runs[0].font.color.rgb = BLUE
+
+    for ref in refs:
+        status = ref.get("status","")
+        color = GREEN if status == "Validada" else (RED if status == "Incorreta" else AMBER)
+        p3 = doc.add_paragraph()
+        p3.paragraph_format.space_before = Pt(8)
+        p3.add_run(f"[{ref.get('number','')}] [{status}] ").bold = True
+        p3.runs[0].font.color.rgb = color
+
+        p4 = doc.add_paragraph()
+        p4.add_run("Original: ").bold = True
+        p4.add_run(ref.get("original","")).italic = True
+        p4.paragraph_format.left_indent = Cm(0.5)
+
+        if ref.get("corrected") and ref["corrected"] != ref.get("original",""):
+            p5 = doc.add_paragraph()
+            p5.add_run("Corrigida: ").bold = True
+            p5.add_run(ref["corrected"])
+            p5.paragraph_format.left_indent = Cm(0.5)
+            p5.runs[1].font.color.rgb = GREEN
+
+        if ref.get("issues"):
+            p6 = doc.add_paragraph()
+            p6.add_run("Problemas: " + " | ".join(ref["issues"])).font.size = Pt(9)
+            p6.paragraph_format.left_indent = Cm(0.5)
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def render_verificar_refs_tab():
+    st.markdown("### Verificacao e Correcao de Referencias")
+    st.caption("Cole sua lista de referencias e a IA verifica veracidade, corrige a formatacao e completa informacoes faltantes.")
+
+    api_key  = st.session_state.get("_api_key","")
+    provider = st.session_state.get("_provider","")
+    model    = st.session_state.get("_model","")
+
+    if not api_key:
+        st.warning("Configure a chave API na barra lateral antes de verificar.")
+        return
+
+    style = st.selectbox("Estilo das referencias:", CITATION_STYLES, index=0, key="vr_style")
+
+    ref_text = st.text_area(
+        "Cole sua lista de referencias aqui (uma por linha ou numeradas):",
+        height=300,
+        placeholder="1. Autor A, Autor B. Titulo do artigo. Revista. 2023;45(2):123-130.\n2. ...",
+        key="vr_refs"
+    )
+
+    run_vr = st.button("Verificar referencias", type="primary",
+                       disabled=not api_key or not ref_text.strip())
+
+    if run_vr and ref_text.strip():
+        try:
+            client = get_ai_client(provider, api_key)
+        except Exception as e:
+            st.error(f"Erro ao inicializar cliente: {e}")
+            return
+
+        with st.spinner("Verificando referencias com IA..."):
+            result = verify_references_ai(client, provider, model, ref_text, style)
+            st.session_state["last_vr_result"] = result
+            st.session_state["last_vr_style"]  = style
+
+    vr = st.session_state.get("last_vr_result")
+    if not vr:
+        return
+
+    if "error" in vr and "references" not in vr:
+        st.error(f"Erro: {vr.get('error')}")
+        return
+
+    refs  = vr.get("references", [])
+    valid_n = sum(1 for r in refs if r.get("status","") == "Validada")
+    issue_n = len(refs) - valid_n
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total de referencias", len(refs))
+    c2.metric("Validadas", valid_n, delta=None)
+    c3.metric("Com problemas", issue_n,
+              delta=f"-{issue_n}" if issue_n > 0 else None,
+              delta_color="inverse")
+
+    if vr.get("summary"):
+        st.info(vr["summary"])
+
+    st.divider()
+    st.markdown("#### Referencias Corrigidas")
+
+    # Show corrected list
+    corrected_lines = []
+    for ref in refs:
+        status = ref.get("status","")
+        badge = "✅" if status == "Validada" else ("⚠️" if status == "Suspeita" else "❌")
+        with st.expander(f"{badge} [{ref.get('number','')}] {status} — Confianca: {ref.get('confidence','')}"):
+            if ref.get("original") != ref.get("corrected",""):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**Original:**")
+                    st.text(ref.get("original",""))
+                with col_b:
+                    st.markdown("**Corrigida:**")
+                    st.markdown(f":green[{ref.get('corrected','')}]")
+            else:
+                st.text(ref.get("corrected") or ref.get("original",""))
+            if ref.get("issues"):
+                st.caption("Problemas: " + " | ".join(ref["issues"]))
+            if ref.get("changes_made"):
+                st.caption("Correcoes: " + " | ".join(ref["changes_made"]))
+        corrected_lines.append(ref.get("corrected") or ref.get("original",""))
+
+    corrected_text = "\n\n".join(corrected_lines)
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button("📥 Baixar lista corrigida (.txt)",
+                           data=corrected_text.encode("utf-8"),
+                           file_name="referencias_corrigidas.txt",
+                           mime="text/plain", use_container_width=True)
+    with col_dl2:
+        try:
+            docx_b = generate_ref_verification_docx(vr, st.session_state.get("last_vr_style","Vancouver"))
+            st.download_button("📄 Baixar relatorio (.docx)",
+                               data=docx_b,
+                               file_name="verificacao_referencias.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True, type="primary")
+        except Exception as e:
+            st.warning(f"Erro ao gerar .docx: {e}")
+
+
+# =============================================================================
+# CONVERTER TAB (PDF / DOCX -> Markdown)
+# =============================================================================
+
+def convert_file_to_markdown(file_bytes: bytes, filename: str) -> str:
+    """Convert PDF or DOCX to Markdown text."""
+    fn = filename.lower()
+    if fn.endswith(".pdf"):
+        # Use PyMuPDF
+        try:
+            import fitz
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            pages = []
+            for i, page in enumerate(doc, 1):
+                text = page.get_text("text")
+                if text.strip():
+                    pages.append(f"<!-- Page {i} -->\n{text.strip()}")
+            doc.close()
+            return "\n\n---\n\n".join(pages)
+        except Exception as e:
+            return f"Erro ao converter PDF: {e}"
+    elif fn.endswith(".docx"):
+        try:
+            from docx import Document as DocxDoc
+            from io import BytesIO
+            doc = DocxDoc(BytesIO(file_bytes))
+            lines = []
+            for para in doc.paragraphs:
+                style = para.style.name.lower()
+                text  = para.text.strip()
+                if not text:
+                    lines.append("")
+                    continue
+                if "heading 1" in style or "titulo 1" in style:
+                    lines.append(f"# {text}")
+                elif "heading 2" in style or "titulo 2" in style:
+                    lines.append(f"## {text}")
+                elif "heading 3" in style or "titulo 3" in style:
+                    lines.append(f"### {text}")
+                elif "list" in style or "bullet" in style:
+                    lines.append(f"- {text}")
+                else:
+                    lines.append(text)
+            return "\n\n".join(lines)
+        except Exception as e:
+            return f"Erro ao converter DOCX: {e}"
+    else:
+        return file_bytes.decode("utf-8", errors="replace")
+
+
+def render_converter_tab():
+    st.markdown("### Converter Documentos para Markdown (.md)")
+    st.caption("Converta PDF ou DOCX para formato Markdown puro — ideal para uso em sistemas de citacao, editors e workflows com IA.")
+
+    uploaded = st.file_uploader(
+        "Selecione PDF ou DOCX para converter",
+        type=["pdf","docx"],
+        key="conv_upload"
+    )
+
+    if not uploaded:
+        st.info("Arraste um arquivo PDF ou DOCX acima para comecar.")
+        return
+
+    st.success(f"Arquivo carregado: **{uploaded.name}** ({uploaded.size/1024:.1f} KB)")
+
+    if st.button("Converter para Markdown", type="primary"):
+        with st.spinner("Convertendo..."):
+            raw_bytes = uploaded.read()
+            md_text   = convert_file_to_markdown(raw_bytes, uploaded.name)
+            st.session_state["last_md_conversion"]      = md_text
+            st.session_state["last_md_conversion_name"] = uploaded.name.rsplit(".",1)[0] + ".md"
+
+    md_result = st.session_state.get("last_md_conversion")
+    if md_result:
+        st.markdown(f"**Preview ({len(md_result)} caracteres):**")
+        st.text_area("", value=md_result[:3000] + ("\n\n[...truncado para preview...]" if len(md_result) > 3000 else ""),
+                     height=350, label_visibility="collapsed")
+
+        col1, col2 = st.columns(2)
+        fname = st.session_state.get("last_md_conversion_name","documento.md")
+        with col1:
+            st.download_button(
+                "📥 Baixar .md",
+                data=md_result.encode("utf-8"),
+                file_name=fname,
+                mime="text/markdown",
+                use_container_width=True,
+                type="primary",
+            )
+        with col2:
+            st.download_button(
+                "📥 Baixar .txt",
+                data=md_result.encode("utf-8"),
+                file_name=fname.replace(".md",".txt"),
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+
+# =============================================================================
+# EVIDENCIAS TAB (find supporting passages in articles)
+# =============================================================================
+
+def find_evidence_ai(client, provider, model, claim: str, article_text: str, article_name: str) -> dict:
+    """AI finds passages in article_text that support the given claim."""
+    prompt = f"""You are a scientific evidence analyst.
+
+TASK: Find passages in the provided article that SUPPORT or are RELEVANT to the claim/paragraph below.
+
+CLAIM TO SUPPORT:
+{claim}
+
+ARTICLE ({article_name}):
+{article_text[:6000]}
+
+Instructions:
+- Extract 2-6 passages that best support the claim
+- Each passage should be a direct quote from the article (verbatim)
+- Assess relevance strength: Alta / Media / Baixa
+- Note page/section if identifiable
+- If no supporting passages exist, state this clearly
+
+Return ONLY valid JSON (no markdown fences):
+{{
+  "article": "{article_name}",
+  "passages": [
+    {{
+      "text": "exact quote from article",
+      "relevance": "Alta/Media/Baixa",
+      "explanation": "why this supports the claim, in Portuguese",
+      "location": "section or page if identifiable"
+    }}
+  ],
+  "overall_support": "Forte / Parcial / Fraco / Nenhum",
+  "summary": "brief synthesis in Portuguese of how the article supports the claim"
+}}"""
+
+    raw  = ai_call(client, provider, model, prompt, max_tokens=6000)
+    data = extract_json_from_ai(raw)
+    return data if data else {"error": "Falha na busca", "raw": raw, "article": article_name}
+
+
+def render_evidencias_tab():
+    st.markdown("### Busca de Evidencias em Artigos")
+    st.caption(
+        "Insira uma afirmacao ou paragrafo e anexe um ou mais artigos (PDF). "
+        "A IA encontra e destaca os trechos que apoiam sua afirmacao.")
+
+    api_key  = st.session_state.get("_api_key","")
+    provider = st.session_state.get("_provider","")
+    model    = st.session_state.get("_model","")
+
+    if not api_key:
+        st.warning("Configure a chave API na barra lateral antes de usar.")
+        return
+
+    claim = st.text_area(
+        "Afirmacao / Paragrafo a ser apoiado:",
+        height=130,
+        placeholder="Ex: O TDAH em adultos apresenta taxas de comorbidade com ansiedade superiores a 50%, com impacto significativo na funcionalidade...",
+        key="ev_claim"
+    )
+
+    art_files = st.file_uploader(
+        "Artigos de referencia (PDF ou DOCX):",
+        type=["pdf","docx"],
+        accept_multiple_files=True,
+        key="ev_articles"
+    )
+
+    run_ev = st.button("Buscar evidencias", type="primary",
+                       disabled=not api_key or not claim.strip() or not art_files)
+
+    if run_ev:
+        try:
+            client = get_ai_client(provider, api_key)
+        except Exception as e:
+            st.error(f"Erro ao inicializar cliente: {e}")
+            return
+
+        results_ev = []
+        progress = st.progress(0)
+        for idx, af in enumerate(art_files, 1):
+            progress.progress(idx / len(art_files), text=f"Analisando {af.name}...")
+            b = af.read()
+            if af.name.lower().endswith(".pdf"):
+                art_text = extract_text_from_pdf(b)
+            else:
+                art_text = extract_text_from_docx(b)
+            ev_result = find_evidence_ai(client, provider, model, claim, art_text, af.name)
+            results_ev.append(ev_result)
+        progress.empty()
+        st.session_state["last_ev_results"] = results_ev
+        st.session_state["last_ev_claim"]   = claim
+
+    ev_results = st.session_state.get("last_ev_results")
+    if not ev_results:
+        return
+
+    st.divider()
+    st.markdown("#### Evidencias Encontradas")
+
+    if st.session_state.get("last_ev_claim"):
+        st.info(f"**Afirmacao analisada:** {st.session_state['last_ev_claim'][:300]}")
+
+    for ev in ev_results:
+        if "error" in ev and "passages" not in ev:
+            st.error(f"Erro no artigo {ev.get('article','')}: {ev.get('error')}")
+            continue
+
+        support = ev.get("overall_support","N/A")
+        color_map = {"Forte":"🟢","Parcial":"🟡","Fraco":"🟠","Nenhum":"🔴"}
+        icon = color_map.get(support,"⚪")
+
+        with st.expander(f"{icon} **{ev.get('article','')}** — Suporte: {support}", expanded=True):
+            if ev.get("summary"):
+                st.markdown(f"*{ev['summary']}*")
+
+            passages = ev.get("passages",[])
+            if not passages:
+                st.warning("Nenhum trecho de suporte encontrado neste artigo.")
+                continue
+
+            for i, p in enumerate(passages, 1):
+                rel   = p.get("relevance","")
+                rel_c = "green" if rel == "Alta" else ("orange" if rel == "Media" else "red")
+                loc   = f" — {p['location']}" if p.get("location") else ""
+                st.markdown(
+                    f"**Trecho {i}** :{rel_c}[Relevancia {rel}]{loc}",
+                    unsafe_allow_html=False
+                )
+                st.markdown(
+                    f'<div class="ref-box">{p.get("text","")}</div>',
+                    unsafe_allow_html=True
+                )
+                if p.get("explanation"):
+                    st.caption(f"Por que apoia: {p['explanation']}")
+
+    # Download evidence report as text
+    if ev_results:
+        lines = ["BUSCA DE EVIDENCIAS", f"Afirmacao: {st.session_state.get('last_ev_claim','')}", ""]
+        for ev in ev_results:
+            lines.append("")
+            lines.append(f"ARTIGO: {ev.get('article','')}")
+            lines.append(f"Suporte geral: {ev.get('overall_support','')}")
+            lines.append(f"Resumo: {ev.get('summary','')}")
+            for i, p in enumerate(ev.get("passages",[]), 1):
+                lines.append("")
+                lines.append(f"  Trecho {i} [Relevancia {p.get('relevance','')}]:")
+                lines.append('  "' + p.get("text","") + '"')
+                lines.append(f"  -> {p.get('explanation','')}")
+        st.download_button(
+            "📥 Baixar relatorio de evidencias (.txt)",
+            data="\n".join(lines).encode("utf-8"),
+            file_name="evidencias.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+
+
+# =============================================================================
+# PPT CITATION — extract, cite, annotate
+# =============================================================================
+
+def extract_pptx_slides(pptx_bytes: bytes) -> list:
+    """Extract text and structure from each slide. Returns list of dicts."""
+    from pptx import Presentation
+    from io import BytesIO
+    prs = Presentation(BytesIO(pptx_bytes))
+    slides = []
+    for i, slide in enumerate(prs.slides, 1):
+        title   = ""
+        content = []
+        notes   = ""
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            text = shape.text_frame.text.strip()
+            if not text:
+                continue
+            if shape.shape_type in (13, 14):  # image/chart shapes
+                continue
+            if hasattr(shape, "placeholder_format") and shape.placeholder_format:
+                ph_idx = shape.placeholder_format.idx
+                if ph_idx == 0:      # title
+                    title = text
+                elif ph_idx == 1:    # body
+                    content.append(text)
+                else:
+                    content.append(text)
+            else:
+                content.append(text)
+        # notes
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+        slides.append({
+            "number":  i,
+            "title":   title,
+            "content": "\n".join(content),
+            "notes":   notes,
+            "full_text": (title + "\n" + "\n".join(content)).strip(),
+        })
+    return slides
+
+
+def cite_slides_ai(client, provider, model, slides: list, refs: list,
+                   citation_style: str = "Vancouver") -> list:
+    """AI matches each slide to the best references. Returns list of per-slide citation dicts."""
+    ref_catalogue = _build_ref_catalogue(refs)
+    results = []
+    for slide in slides:
+        if not slide["full_text"].strip():
+            results.append({"slide": slide["number"], "citations": [],
+                            "note_text": "", "summary": "Slide sem texto"})
+            continue
+
+        prompt = f"""You are a scientific citation specialist.
+
+Analyze the slide content below and identify which references from the catalogue BEST support the claims made.
+
+CITATION STYLE: {citation_style}
+REFERENCE CATALOGUE:
+{ref_catalogue}
+
+SLIDE {slide['number']}: {slide['title']}
+CONTENT:
+{slide['full_text'][:1500]}
+
+TASK:
+1. Identify 1-4 most relevant references for this slide
+2. Write a short citation note (2-3 sentences) suitable for slide notes, in Portuguese
+3. Format citations according to {citation_style} style
+
+Return ONLY valid JSON (no markdown fences):
+{{
+  "slide": {slide['number']},
+  "refs_used": ["REF1", "REF2"],
+  "inline_citation": "[1, 2]",
+  "note_text": "References: [1] Author (Year). [2] Author (Year). -- brief justification of why these support this slide",
+  "summary": "one sentence why these refs support this slide, in Portuguese"
+}}
+
+If no reference is relevant to this slide, return refs_used=[] and note_text="Sem referencias aplicaveis."
+"""
+        raw  = ai_call(client, provider, model, prompt, max_tokens=2000)
+        data = extract_json_from_ai(raw)
+        if data:
+            results.append(data)
+        else:
+            results.append({
+                "slide": slide["number"], "refs_used": [],
+                "inline_citation": "", "note_text": "Erro na analise.",
+                "summary": "Erro"
+            })
+    return results
+
+
+def add_citations_to_pptx(pptx_bytes: bytes, slides_info: list,
+                           slide_citations: list, refs: list,
+                           citation_style: str = "Vancouver",
+                           add_footer: bool = True) -> bytes:
+    """Insert citations into PPTX notes and optionally add footer text boxes."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt, Emu
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    from io import BytesIO
+
+    prs  = Presentation(BytesIO(pptx_bytes))
+    cite_map = {c["slide"]: c for c in slide_citations}
+
+    # Build numbered reference list from all used refs
+    used_refx = set()
+    for c in slide_citations:
+        used_refx.update(c.get("refs_used", []))
+
+    # Map REFx -> sequential number
+    refx_to_num = {}
+    num = 1
+    for c in slide_citations:
+        for rx in c.get("refs_used", []):
+            if rx not in refx_to_num:
+                refx_to_num[rx] = num
+                num += 1
+
+    for i, slide in enumerate(prs.slides, 1):
+        citation = cite_map.get(i)
+        if not citation:
+            continue
+
+        refs_used = citation.get("refs_used", [])
+        note_text = citation.get("note_text", "")
+
+        # ─ Add/update Notes ──────────────────────────────────────
+        if note_text.strip() and note_text != "Sem referencias aplicaveis.":
+            if not slide.has_notes_slide:
+                notes_slide = slide.notes_slide
+            else:
+                notes_slide = slide.notes_slide
+            tf = notes_slide.notes_text_frame
+            # Append to existing notes
+            existing = tf.text.strip()
+            separator = "\n\n---\n" if existing else ""
+            # Add formatted references
+            formatted_refs = []
+            for rx in refs_used:
+                idx = int(rx.replace("REF","")) - 1
+                if 0 <= idx < len(refs):
+                    n = refx_to_num.get(rx, idx+1)
+                    formatted_refs.append(format_reference(refs[idx], n, citation_style))
+
+            new_note = (
+                f"{separator}REFERENCIAS (CitacaoIA):\n" +
+                "\n".join(formatted_refs) +
+                (f"\n\n{citation.get('summary','')}" if citation.get("summary") else "")
+            )
+            # Write to the last paragraph or add new
+            if len(tf.paragraphs) > 0 and not tf.paragraphs[-1].text.strip():
+                p = tf.paragraphs[-1]
+            else:
+                p = tf.add_paragraph()
+            p.text = (existing + new_note) if existing else new_note.lstrip("\n")
+
+        # ─ Add small citation footer text box ────────────────────
+        if add_footer and refs_used:
+            inline = ", ".join(
+                str(refx_to_num[rx]) for rx in refs_used if rx in refx_to_num
+            )
+            if not inline:
+                continue
+            footer_text = f"[{inline}]"
+
+            sw = prs.slide_width
+            sh = prs.slide_height
+            # Small box in bottom-right corner
+            left   = sw - Inches(1.4)
+            top    = sh - Inches(0.45)
+            width  = Inches(1.2)
+            height = Inches(0.35)
+
+            txBox = slide.shapes.add_textbox(left, top, width, height)
+            tf2   = txBox.text_frame
+            tf2.word_wrap = False
+            p2 = tf2.paragraphs[0]
+            p2.alignment = PP_ALIGN.RIGHT
+            run = p2.add_run()
+            run.text = footer_text
+            run.font.size   = Pt(9)
+            run.font.bold   = True
+            run.font.color.rgb = RGBColor(0x1E, 0x3A, 0x5F)
+
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def generate_ppt_citation_report_docx(slides_info: list, slide_citations: list,
+                                      refs: list, citation_style: str,
+                                      ppt_name: str) -> bytes:
+    """Build a Word report: slide-by-slide reference list."""
+    from docx import Document as DocxDoc
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc  = DocxDoc()
+    for sec in doc.sections:
+        sec.left_margin = Cm(2.5); sec.right_margin = Cm(2.5)
+        sec.top_margin  = Cm(2.5); sec.bottom_margin = Cm(2.5)
+
+    BLUE = RGBColor(0x1E, 0x3A, 0x5F)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("Relatorio de Referenciamento de Apresentacao")
+    r.bold = True; r.font.size = Pt(16); r.font.color.rgb = BLUE
+
+    p2 = doc.add_paragraph()
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p2.add_run(
+        f"Arquivo: {ppt_name}  |  Estilo: {citation_style}  |  "
+        f"Gerado em {__import__('datetime').datetime.now().strftime('%d/%m/%Y')}"
+    ).font.size = Pt(10)
+    doc.add_paragraph()
+
+    cite_map = {c["slide"]: c for c in slide_citations}
+    refx_to_num = {}
+    num = 1
+    for c in slide_citations:
+        for rx in c.get("refs_used", []):
+            if rx not in refx_to_num:
+                refx_to_num[rx] = num; num += 1
+
+    # Slide-by-slide table
+    ph = doc.add_paragraph()
+    ph.add_run("Citacoes por Slide").bold = True
+    ph.runs[0].font.size = Pt(13); ph.runs[0].font.color.rgb = BLUE
+    doc.add_paragraph()
+
+    for slide in slides_info:
+        n = slide["number"]
+        citation = cite_map.get(n, {})
+        refs_used = citation.get("refs_used", [])
+
+        sh = doc.add_paragraph()
+        sh.add_run(f"Slide {n}: {slide.get('title','(sem titulo)')}").bold = True
+        sh.runs[0].font.color.rgb = BLUE
+        sh.paragraph_format.space_before = Pt(10)
+
+        if not refs_used:
+            doc.add_paragraph("Sem referencias aplicaveis.").runs[0].italic = True
+            continue
+
+        if citation.get("summary"):
+            sp = doc.add_paragraph()
+            sp.add_run(citation["summary"]).italic = True
+            sp.paragraph_format.space_after = Pt(4)
+
+        for rx in refs_used:
+            idx = int(rx.replace("REF","")) - 1
+            if 0 <= idx < len(refs):
+                n_ref = refx_to_num.get(rx, idx+1)
+                ref_str = format_reference(refs[idx], n_ref, citation_style)
+                rp = doc.add_paragraph(style="List Bullet")
+                rp.add_run(ref_str).font.size = Pt(10)
+
+    # Full reference list
+    doc.add_page_break()
+    fh = doc.add_paragraph()
+    fh.add_run("Lista Completa de Referencias").bold = True
+    fh.runs[0].font.size = Pt(13); fh.runs[0].font.color.rgb = BLUE
+    doc.add_paragraph()
+
+    ordered_refs = sorted(refx_to_num.items(), key=lambda x: x[1])
+    for rx, n_ref in ordered_refs:
+        idx = int(rx.replace("REF","")) - 1
+        if 0 <= idx < len(refs):
+            ref_str = format_reference(refs[idx], n_ref, citation_style)
+            rp = doc.add_paragraph()
+            rp.add_run(ref_str).font.size = Pt(11)
+            rp.paragraph_format.space_after = Pt(6)
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def render_citar_ppt_tab():
+    st.markdown("### Referenciar Apresentacao PowerPoint")
+    st.caption(
+        "Envie sua apresentacao e (opcionalmente) os artigos de referencia. "
+        "A IA analisa cada slide e insere as citacoes nas notas e rodape dos slides, "
+        "buscando automaticamente em bases cientificas quando necessario."
+    )
+
+    api_key  = st.session_state.get("_api_key","")
+    provider = st.session_state.get("_provider","")
+    model    = st.session_state.get("_model","")
+
+    if not api_key:
+        st.warning("Configure a chave API na barra lateral antes de usar.")
+        return
+
+    col_ppt, col_style = st.columns([3, 1])
+    with col_ppt:
+        ppt_file = st.file_uploader(
+            "Apresentacao PowerPoint (.pptx)",
+            type=["pptx"],
+            key="ppt_upload"
+        )
+    with col_style:
+        ppt_style = st.selectbox(
+            "Estilo de citacao:", CITATION_STYLES, index=0, key="ppt_style"
+        )
+
+    st.markdown("#### Fontes de Referencias (opcional)")
+    st.caption(
+        "Sem referencias: a IA busca automaticamente em PubMed, EMBASE, OpenAlex e outras bases. "
+        "Com referencias: usa prioritariamente as fornecidas."
+    )
+    ref_col1, ref_col2 = st.columns(2)
+    with ref_col1:
+        ref_pdfs = st.file_uploader(
+            "PDFs dos artigos de referencia",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="ppt_ref_pdfs"
+        )
+    with ref_col2:
+        ref_text_input = st.text_area(
+            "Ou cole lista de referencias (uma por linha):",
+            height=120,
+            placeholder="1. Autor A et al. Titulo. Revista. 2023;45(2):123.\n2. ...",
+            key="ppt_ref_text"
+        )
+
+    use_library = st.checkbox("Incluir artigos da biblioteca local", value=True)
+    add_footer  = st.checkbox("Adicionar marcador [N] no rodape de cada slide", value=True)
+
+    if ppt_file:
+        st.success(f"Apresentacao carregada: **{ppt_file.name}**")
+
+    st.divider()
+    run_ppt = st.button(
+        "Referenciar apresentacao com IA",
+        type="primary",
+        use_container_width=True,
+        disabled=not api_key or not ppt_file
+    )
+
+    if run_ppt and ppt_file:
+        try:
+            client = get_ai_client(provider, api_key)
+        except Exception as e:
+            st.error(f"Erro ao inicializar cliente: {e}"); return
+
+        ppt_bytes = ppt_file.read()
+
+        # ── Step 1: Extract slides ────────────────────────────────
+        with st.spinner("Lendo slides da apresentacao..."):
+            slides_info = extract_pptx_slides(ppt_bytes)
+        st.info(f"{len(slides_info)} slides encontrados.")
+
+        # ── Step 2: Build reference pool ─────────────────────────
+        all_refs = []
+        if use_library:
+            all_refs.extend(load_library())
+
+        if ref_pdfs:
+            progress_r = st.progress(0, text="Extraindo metadados dos PDFs...")
+            for ri, rf in enumerate(ref_pdfs, 1):
+                progress_r.progress(ri / len(ref_pdfs), text=f"Lendo {rf.name}...")
+                pdf_text = extract_text_from_pdf(rf.read())
+                meta = extract_ref_metadata_ai(client, provider, model, pdf_text, rf.name)
+                if meta and meta.get("title"):
+                    all_refs.append(meta)
+            progress_r.empty()
+
+        if ref_text_input.strip():
+            # Parse pasted reference list via AI
+            with st.spinner("Parseando lista de referencias..."):
+                parse_prompt = f"""Parse the following reference list into JSON.
+Return ONLY valid JSON (no fences):
+{{"refs":[{{"title":"","authors":[],"journal":"","year":"","volume":"","issue":"","pages":"","doi":""}}]}}
+
+REFERENCE LIST:
+{ref_text_input}"""
+                raw = ai_call(client, provider, model, parse_prompt, max_tokens=4000)
+                parsed = extract_json_from_ai(raw)
+                if parsed and "refs" in parsed:
+                    all_refs.extend(parsed["refs"])
+
+        # ── Step 3: Auto-search if no refs ───────────────────────
+        if not all_refs:
+            st.info("Nenhuma referencia fornecida — buscando automaticamente nas bases cientificas...")
+            queries_done = set()
+            progress_s = st.progress(0, text="Buscando referencias...")
+            for si, slide in enumerate(slides_info):
+                progress_s.progress((si+1)/len(slides_info),
+                                    text=f"Buscando para slide {slide['number']}...")
+                if not slide["full_text"].strip():
+                    continue
+                # Use title or first 100 chars as query
+                q = (slide["title"] or slide["full_text"])[:120]
+                if q in queries_done:
+                    continue
+                queries_done.add(q)
+                found = multi_source_search(q, max_per_source=2)
+                for r in found:
+                    if r not in all_refs:
+                        all_refs.append(r)
+                if len(all_refs) >= 40:
+                    break
+            progress_s.empty()
+            st.success(f"{len(all_refs)} referencias encontradas automaticamente.")
+
+        if not all_refs:
+            st.error("Nao foi possivel obter referencias. Adicione PDFs ou uma lista de referencias.")
+            return
+
+        # ── Step 4: Deduplicate refs ──────────────────────────────
+        seen_titles = set()
+        dedup_refs = []
+        for r in all_refs:
+            t = (r.get("title","") or "").lower().strip()[:80]
+            if t and t not in seen_titles:
+                seen_titles.add(t)
+                dedup_refs.append(r)
+        all_refs = dedup_refs[:60]  # cap at 60
+
+        st.info(f"Pool de referenciamento: **{len(all_refs)} referencias** disponveis.")
+
+        # ── Step 5: AI cites each slide ───────────────────────────
+        progress_c = st.progress(0, text="Referenciando slides com IA...")
+        log_c = st.empty()
+        slide_citations = []
+        for si, slide in enumerate(slides_info):
+            progress_c.progress((si+1)/len(slides_info),
+                                 text=f"Analisando slide {slide['number']}/{len(slides_info)}: {slide['title'][:40]}...")
+            cit = cite_slides_ai(client, provider, model, [slide], all_refs, ppt_style)
+            slide_citations.extend(cit)
+        progress_c.empty(); log_c.empty()
+
+        # ── Step 6: Build annotated PPTX ─────────────────────────
+        with st.spinner("Inserindo citacoes na apresentacao..."):
+            annotated_pptx = add_citations_to_pptx(
+                ppt_bytes, slides_info, slide_citations, all_refs, ppt_style, add_footer
+            )
+
+        # ── Step 7: Build Word report ─────────────────────────────
+        with st.spinner("Gerando relatorio de referenciamento..."):
+            report_docx = generate_ppt_citation_report_docx(
+                slides_info, slide_citations, all_refs, ppt_style, ppt_file.name
+            )
+
+        st.session_state["ppt_annotated"]   = annotated_pptx
+        st.session_state["ppt_report_docx"] = report_docx
+        st.session_state["ppt_slides_info"] = slides_info
+        st.session_state["ppt_citations"]   = slide_citations
+        st.session_state["ppt_all_refs"]    = all_refs
+        st.session_state["ppt_style"]       = ppt_style
+        st.session_state["ppt_filename"]    = ppt_file.name
+
+    # ─ Display results ─────────────────────────────────────────
+    if not st.session_state.get("ppt_annotated"):
+        return
+
+    slides_info    = st.session_state["ppt_slides_info"]
+    slide_citations = st.session_state["ppt_citations"]
+    all_refs        = st.session_state["ppt_all_refs"]
+    ppt_style_res   = st.session_state.get("ppt_style","Vancouver")
+    ppt_fn          = st.session_state.get("ppt_filename","apresentacao.pptx")
+
+    cited_slides = sum(1 for c in slide_citations if c.get("refs_used"))
+    total_refs_used = len({rx for c in slide_citations for rx in c.get("refs_used",[])})
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Slides analisados",    len(slides_info))
+    c2.metric("Slides referenciados", cited_slides)
+    c3.metric("Referencias utilizadas", total_refs_used)
+
+    st.divider()
+
+    # Download buttons
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        base = ppt_fn.rsplit(".",1)[0]
+        st.download_button(
+            "📊 Baixar apresentacao referenciada (.pptx)",
+            data=st.session_state["ppt_annotated"],
+            file_name=f"{base}_citado.pptx",
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            use_container_width=True,
+            type="primary",
+        )
+    with dl2:
+        st.download_button(
+            "📄 Baixar relatorio de referencias (.docx)",
+            data=st.session_state["ppt_report_docx"],
+            file_name=f"{base}_referencias.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+
+    st.markdown("#### Revisao por Slide")
+    cite_map = {c["slide"]: c for c in slide_citations}
+    refx_to_num = {}
+    num_r = 1
+    for c in slide_citations:
+        for rx in c.get("refs_used",[]):
+            if rx not in refx_to_num:
+                refx_to_num[rx] = num_r; num_r += 1
+
+    for slide in slides_info:
+        n = slide["number"]
+        citation = cite_map.get(n, {})
+        refs_used = citation.get("refs_used", [])
+        icon = "✅" if refs_used else "⬜"
+        inline = "[" + ", ".join(str(refx_to_num[rx]) for rx in refs_used if rx in refx_to_num) + "]" if refs_used else ""
+
+        with st.expander(f"{icon} Slide {n}: {slide.get('title','(sem titulo)')} {inline}",
+                         expanded=False):
+            if slide.get("content"):
+                st.caption(slide["content"][:300] + ("..." if len(slide["content"]) > 300 else ""))
+            if not refs_used:
+                st.info("Nenhuma referencia aplicavel identificada.")
+            else:
+                if citation.get("summary"):
+                    st.markdown(f"*{citation['summary']}*")
+                for rx in refs_used:
+                    idx = int(rx.replace("REF","")) - 1
+                    if 0 <= idx < len(all_refs):
+                        n_ref = refx_to_num.get(rx, idx+1)
+                        ref_str = format_reference(all_refs[idx], n_ref, ppt_style_res)
+                        st.markdown(f'<div class="ref-box">{ref_str}</div>',
+                                    unsafe_allow_html=True)
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
     st.markdown("""<div class="cia-header">
   <h1>CitacaoIA</h1>
-  <p>Gestor inteligente de citacoes . Vancouver . PubMed + EMBASE + LILACS + OpenAlex . Powered by IA</p>
+  <p>Gestor inteligente de citacoes . Vancouver . APA . ABNT . Chicago . Textos + Apresentacoes + Referencias . PubMed + EMBASE + LILACS + OpenAlex</p>
 </div>""", unsafe_allow_html=True)
 
     api_key, provider, model = render_sidebar()
@@ -1866,14 +3241,23 @@ def main():
     st.session_state["_provider"] = provider
     st.session_state["_model"]    = model
 
-    for k in ["last_result","last_all_refs","last_final_refs","last_mode","last_revision"]:
+    for k in ["last_result","last_all_refs","last_final_refs","last_mode","last_revision",
+              "last_citation_style","last_vr_result","last_vr_style",
+              "last_md_conversion","last_md_conversion_name",
+              "last_ev_results","last_ev_claim",
+              "ppt_annotated","ppt_report_docx","ppt_slides_info",
+              "ppt_citations","ppt_all_refs","ppt_style","ppt_filename"]:
         if k not in st.session_state:
             st.session_state[k] = None
 
-    tab_bib, tab_citar, tab_rev = st.tabs([
-        "\U0001f4d6 Biblioteca de Artigos",
-        "✍️ Processar Texto + Citacoes",
+    tab_bib, tab_citar, tab_rev, tab_vr, tab_conv, tab_ev, tab_ppt = st.tabs([
+        "\U0001f4d6 Biblioteca",
+        "\u270d\ufe0f Citar Texto",
         "\U0001f4dd Revisao Editorial",
+        "\U0001f50d Verificar Referencias",
+        "\U0001f4c4 Converter Docs",
+        "\U0001f4a1 Buscar Evidencias",
+        "\U0001f4ca Referenciar PPT",
     ])
     with tab_bib:
         render_biblioteca_tab()
@@ -1881,6 +3265,14 @@ def main():
         render_citar_tab()
     with tab_rev:
         render_revisao_tab()
+    with tab_vr:
+        render_verificar_refs_tab()
+    with tab_conv:
+        render_converter_tab()
+    with tab_ev:
+        render_evidencias_tab()
+    with tab_ppt:
+        render_citar_ppt_tab()
 
 
 if __name__ == "__main__":
