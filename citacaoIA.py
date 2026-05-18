@@ -742,7 +742,10 @@ def extract_json_from_ai(text: str) -> dict | None:
     return None
 
 
-CHUNK_CHAR_LIMIT = 2800  # max chars per chunk sent to the AI
+CHUNK_CHAR_LIMIT = 2800  # default max chars per chunk
+CHUNK_CHAR_LIMIT_GEMINI = 1800  # Gemini needs smaller chunks to avoid truncation
+CHUNK_CHAR_LIMIT_OPENAI = 2800
+
 
 
 def chunk_text(text: str, max_chars: int = CHUNK_CHAR_LIMIT) -> list:
@@ -881,6 +884,11 @@ IMPORTANT: in refs_used and reference_map, only use the exact REFx tags from the
 
     raw  = ai_call(client, provider, model, prompt, max_tokens=8000)
     data = extract_json_from_ai(raw)
+    if not data:
+        # Retry with smaller prompt on failure
+        short_prompt = prompt.replace(chunk_text, chunk_text[:800])
+        raw2 = ai_call(client, provider, model, short_prompt, max_tokens=4000)
+        data = extract_json_from_ai(raw2)
     return data if data else {"error": "Falha no processamento", "raw": raw}
 
 
@@ -945,7 +953,9 @@ def _renumber_citations(paragraphs: list, refs: list) -> tuple:
 
 def insert_citations_ai(client, provider, model, text, refs, mode, citation_style="Vancouver") -> dict:
     ref_catalogue = _build_ref_catalogue(refs)
-    chunks = chunk_text(text, max_chars=CHUNK_CHAR_LIMIT)
+    # Use smaller chunks for Gemini to avoid JSON truncation
+    chunk_limit = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
+    chunks = chunk_text(text, max_chars=chunk_limit)
 
     all_paragraphs  = []
     all_changes     = []
@@ -1012,7 +1022,8 @@ def run_pipeline(client, provider, model, main_text, ref_files, mode, library_re
 
     # ── 2. Identify citation needs PER CHUNK ──────────────────────────────────
     # Chunk the text so identify_citation_needs is never called with too many tokens
-    text_chunks = chunk_text(main_text, max_chars=CHUNK_CHAR_LIMIT)
+    chunk_limit = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
+    text_chunks = chunk_text(main_text, max_chars=chunk_limit)
     n_chunks    = len(text_chunks)
     upd(20, f"Identificando necessidades de citacao em {n_chunks} parte(s)...")
 
@@ -1074,7 +1085,10 @@ TEXT (first 1500 chars):
 
     # ── 5. Insert / review citations ──────────────────────────────────────────
     upd(65, "Inserindo/corrigindo citacoes com IA...")
-    result = insert_citations_ai(client, provider, model, main_text, all_refs, mode)
+    try:
+        result = insert_citations_ai(client, provider, model, main_text, all_refs, mode, citation_style)
+    except Exception as e_ins:
+        result = {"error": str(e_ins), "paragraphs": [], "reference_map": {}}
     upd(90, "Montando resultado final...")
 
     # Use the ordered ref list produced by the renumbering pass
@@ -1222,6 +1236,13 @@ def generate_docx(paragraphs: list, final_ref_list: list, mode: str, citation_st
 # =============================================================================
 
 def display_results(result, all_refs, final_ref_list, mode):
+    # Show prominent error if pipeline reported failure
+    if result.get("error") and not result.get("paragraphs"):
+        st.error(f"Erro no processamento: {result['error']}")
+        if result.get("raw"):
+            with st.expander("Ver resposta bruta da IA"):
+                st.text(str(result["raw"])[:3000])
+        return
     if "error" in result and not result.get("paragraphs"):
         st.error(f"Erro: {result.get('error')}")
         with st.expander("Ver resposta bruta"):
@@ -1252,36 +1273,41 @@ def display_results(result, all_refs, final_ref_list, mode):
 
     with tab_final:
         body = "\n\n".join(p.get("modified") or p.get("original","") for p in paragraphs)
-        ref_lines = ["\n\n" + "-"*60, "REFERENCIAS", "-"*60]
+        cstyle_disp = st.session_state.get("last_citation_style","Vancouver")
+        ref_lines = ["\n\n" + "-"*60, f"REFERENCIAS ({cstyle_disp})", "-"*60]
         if final_ref_list:
-            for i,r in enumerate(final_ref_list,1): ref_lines.append(format_vancouver(r,i))
+            for i,r in enumerate(final_ref_list,1): ref_lines.append(format_reference(r,i,cstyle_disp))
         else:
             ref_lines.append("(referencias nao resolvidas)")
         full = body + "\n".join(ref_lines)
         st.text_area("", value=full, height=500, label_visibility="collapsed")
 
+        # Always show TXT download first
+        txt_fname = "texto_citado.txt"
+        docx_fname = "texto_citado.docx"
         col_dl1, col_dl2 = st.columns(2)
         with col_dl1:
             st.download_button(
-                "📥 Baixar texto (.txt)",
+                "📥 Baixar (.txt)",
                 data=full.encode("utf-8"),
-                file_name="texto_citacoes_vancouver.txt",
+                file_name=txt_fname,
                 mime="text/plain",
                 use_container_width=True,
             )
         with col_dl2:
             try:
-                docx_bytes = generate_docx(paragraphs, final_ref_list, mode)
+                cstyle_dl = st.session_state.get("last_citation_style","Vancouver")
+                docx_bytes = generate_docx(paragraphs, final_ref_list, mode, cstyle_dl)
                 st.download_button(
                     "📄 Baixar Word (.docx)",
                     data=docx_bytes,
-                    file_name="texto_citacoes_vancouver.docx",
+                    file_name=docx_fname,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True,
                     type="primary",
                 )
             except Exception as e_docx:
-                st.warning(f"Nao foi possivel gerar o .docx: {e_docx}")
+                st.warning(f"Word nao gerado ({e_docx}) — use o .txt acima")
 
     with tab_compare:
         if not paragraphs:
@@ -1348,15 +1374,20 @@ def _fetch_gemini_models(api_key: str) -> list:
                 fetched.append(name)
         # Prefer flash/pro order, filter out embedding-only models
         fetched = [n for n in fetched if "embed" not in n.lower()]
-        return fetched if fetched else ["gemini-1.5-flash", "gemini-1.5-pro"]
+        return fetched if fetched else ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
     except Exception:
-        return ["gemini-1.5-flash", "gemini-1.5-pro"]
+        return ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
 
 
 def render_sidebar():
     with st.sidebar:
         st.markdown("## Configuracao da IA")
-        provider = st.selectbox("Provedor", ["Anthropic (Claude)","Google (Gemini)","OpenAI (GPT)"])
+        st.info("⭐ **Recomendado:** Claude Haiku (melhor custo x qualidade para citacoes)")
+        provider = st.selectbox(
+            "Provedor",
+            ["Anthropic (Claude)", "Google (Gemini)", "OpenAI (GPT)"],
+            index=0,  # Anthropic default
+        )
 
         # Labels / URLs per provider
         if provider == "Anthropic (Claude)":
@@ -1378,7 +1409,11 @@ def render_sidebar():
 
         # Model selection
         if provider == "Anthropic (Claude)":
-            models = ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5-20251001"]
+            models = [
+                "claude-haiku-4-5-20251001",   # ⭐ Recomendado — rapido e economico
+                "claude-sonnet-4-5",           # Melhor qualidade
+                "claude-opus-4-6",             # Maxima capacidade
+            ]
         elif provider == "Google (Gemini)":
             if api_key:
                 # Cache per (truncated) key so we don't re-fetch on every render
@@ -1391,11 +1426,23 @@ def render_sidebar():
                     st.session_state.pop(cache_key, None)
                     st.rerun()
             else:
-                models = ["gemini-1.5-flash", "gemini-1.5-pro"]
+                models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
         else:
             models = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
 
-        model = st.selectbox("Modelo", models)
+        model = st.selectbox(
+            "Modelo",
+            models,
+            index=0,  # always pick first = recommended
+        )
+        if "haiku" in model.lower():
+            st.caption("💰 Custo estimado: ~$0.001 por 1000 tokens")
+        elif "flash" in model.lower():
+            st.caption("💰 Custo estimado: gratuito (Google AI Studio)")
+        elif "sonnet" in model.lower() or "4o" in model.lower():
+            st.caption("💰 Custo estimado: ~$0.003 por 1000 tokens")
+        elif "opus" in model.lower():
+            st.caption("💰 Custo estimado: ~$0.015 por 1000 tokens")
 
         st.divider()
         st.markdown("### Como usar")
@@ -1627,13 +1674,20 @@ def render_citar_tab():
     if run_btn:
         main_text = ""
         if text_file:
-            b = text_file.read()
-            main_text = extract_text_from_pdf(b) if text_file.name.lower().endswith(".pdf") \
-                        else extract_text_from_docx(b)
+            b  = text_file.read()
+            fn = text_file.name.lower()
+            if fn.endswith(".pdf"):
+                main_text = extract_text_from_pdf(b)
+            elif fn.endswith(".md"):
+                main_text = b.decode("utf-8", errors="replace")
+            else:
+                main_text = extract_text_from_docx(b)
+            if main_text.startswith("Erro ao ler"):
+                st.error(main_text); return
         else:
             main_text = pasted_text.strip()
 
-        if not main_text:
+        if not main_text or not main_text.strip():
             st.error("Insira o texto principal (upload ou colagem).")
             return
 
@@ -1643,19 +1697,27 @@ def render_citar_tab():
             st.error(f"Erro ao inicializar cliente IA: {e}")
             return
 
-        result, all_refs, final_ref_list = run_pipeline(
-            client, provider, model, main_text, ref_files, mode_key, library_refs, citation_style)
+        with st.spinner("Processando... nao feche esta pagina."):
+          try:
+            result, all_refs, final_ref_list = run_pipeline(
+                client, provider, model, main_text, ref_files, mode_key, library_refs, citation_style)
+          except Exception as e_pipe:
+            st.error(f"Erro no processamento: {e_pipe}")
+            import traceback; st.expander("Detalhes do erro").code(traceback.format_exc())
+            return
         st.session_state["last_citation_style"] = citation_style
         st.session_state["last_result"]     = result
         st.session_state["last_all_refs"]   = all_refs
         st.session_state["last_final_refs"] = final_ref_list
         st.session_state["last_mode"]       = mode_key
+        st.rerun()  # force re-render so results appear immediately
 
-    if st.session_state.get("last_result"):
+    _lr = st.session_state.get("last_result")
+    if _lr is not None:  # explicit None check (empty dict is valid result)
         display_results(
-            st.session_state["last_result"],
-            st.session_state["last_all_refs"],
-            st.session_state["last_final_refs"],
+            _lr,
+            st.session_state.get("last_all_refs") or [],
+            st.session_state.get("last_final_refs") or [],
             st.session_state.get("last_mode","add"),
         )
 
