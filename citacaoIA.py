@@ -5,6 +5,8 @@ Uso: streamlit run citacaoIA.py
 """
 
 import re, json, time, os, threading as _threading
+import json as _json_auth
+import os   as _os
 from datetime import datetime
 from io import BytesIO
 
@@ -82,18 +84,8 @@ def _supa_available() -> bool:
 import hashlib as _hashlib
 import uuid    as _uuid
 
-# ── Supabase tables required:
-#   users(id uuid pk, username text unique, password_hash text, role text,
-#         created_at timestamptz, invite_code text)
-#   invite_codes(code text pk, created_at timestamptz, used_by text, used_at timestamptz,
-#                max_uses int, uses int, expires_at timestamptz)
-#   usage_logs(id uuid pk, username text, feature text, detail text, ts timestamptz)
-# ── Fallback: JSON files in outputs dir (for local use / no Supabase)
-
-import os as _os, json as _json_auth
 _AUTH_FILE  = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "auth_db.json")
 _USAGE_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "usage_log.json")
-_ADMIN_USER = "admin"          # hardcoded initial admin username
 
 
 def _hash_pw(pw: str) -> str:
@@ -104,21 +96,8 @@ def _load_auth_db() -> dict:
     if _os.path.exists(_AUTH_FILE):
         with open(_AUTH_FILE, "r") as f:
             return _json_auth.load(f)
-    # Default: create admin with temp password "admin123" and one invite code
-    db = {
-        "users": {
-            _ADMIN_USER: {
-                "password_hash": _hash_pw("admin123"),
-                "role": "admin",
-                "created_at": "",
-                "invite_code_used": "SYSTEM"
-            }
-        },
-        "invite_codes": {},
-        "settings": {}
-    }
-    _save_auth_db(db)
-    return db
+    # Empty DB — first run, no admin yet
+    return {"users": {}, "invite_codes": {}}
 
 
 def _save_auth_db(db: dict):
@@ -142,57 +121,58 @@ def _append_usage_log(username: str, feature: str, detail: str = ""):
         "ts":       __import__("datetime").datetime.now().isoformat()
     })
     with open(_USAGE_FILE, "w") as f:
-        _json_auth.dump(log[-2000:], f, indent=2)   # keep last 2000 entries
+        _json_auth.dump(log[-5000:], f, indent=2)
 
 
-def _gen_invite_code(db: dict, created_by: str, max_uses: int = 1,
-                     expires_days: int = 7) -> str:
+def _gen_invite_code(db: dict, created_by: str,
+                     max_uses: int = 1, expires_days: int = 30) -> str:
     from datetime import datetime, timedelta
     code = str(_uuid.uuid4())[:8].upper()
     db["invite_codes"][code] = {
-        "created_by":  created_by,
-        "created_at":  datetime.now().isoformat(),
-        "max_uses":    max_uses,
-        "uses":        0,
-        "expires_at":  (datetime.now() + timedelta(days=expires_days)).isoformat(),
-        "used_by":     []
+        "created_by": created_by,
+        "created_at": datetime.now().isoformat(),
+        "max_uses":   max_uses,
+        "uses":       0,
+        "expires_at": (datetime.now() + timedelta(days=expires_days)).isoformat(),
+        "used_by":    []
     }
     _save_auth_db(db)
     return code
 
 
 def _validate_invite(db: dict, code: str) -> tuple:
-    """Returns (ok: bool, message: str)"""
     from datetime import datetime
     if code not in db["invite_codes"]:
         return False, "Codigo de convite invalido."
     inv = db["invite_codes"][code]
     if inv["uses"] >= inv["max_uses"]:
-        return False, "Codigo ja foi utilizado o numero maximo de vezes."
+        return False, "Codigo ja utilizado o numero maximo de vezes."
     if datetime.fromisoformat(inv["expires_at"]) < datetime.now():
         return False, "Codigo de convite expirado."
     return True, "OK"
 
 
-def _register_user(db: dict, username: str, password: str, invite_code: str) -> tuple:
+def _register_user(db: dict, username: str, password: str,
+                   invite_code: str, role: str = "user") -> tuple:
     username = username.strip().lower()
-    if not username or len(username) < 3:
-        return False, "Nome de usuario deve ter ao menos 3 caracteres."
-    if not password or len(password) < 6:
+    if len(username) < 3:
+        return False, "Usuario deve ter ao menos 3 caracteres."
+    if len(password) < 6:
         return False, "Senha deve ter ao menos 6 caracteres."
     if username in db["users"]:
         return False, "Nome de usuario ja existe."
-    ok, msg = _validate_invite(db, invite_code)
-    if not ok:
-        return False, msg
+    if role != "admin":
+        ok, msg = _validate_invite(db, invite_code)
+        if not ok:
+            return False, msg
+        db["invite_codes"][invite_code]["uses"] += 1
+        db["invite_codes"][invite_code]["used_by"].append(username)
     db["users"][username] = {
-        "password_hash":  _hash_pw(password),
-        "role":           "user",
-        "created_at":     __import__("datetime").datetime.now().isoformat(),
+        "password_hash":    _hash_pw(password),
+        "role":             role,
+        "created_at":       __import__("datetime").datetime.now().isoformat(),
         "invite_code_used": invite_code
     }
-    db["invite_codes"][invite_code]["uses"] += 1
-    db["invite_codes"][invite_code]["used_by"].append(username)
     _save_auth_db(db)
     return True, "Conta criada com sucesso!"
 
@@ -207,34 +187,72 @@ def _authenticate(db: dict, username: str, password: str) -> tuple:
     return True, user["role"]
 
 
-# ── Supabase wrappers (use local fallback if Supabase not configured) ──────
+def _change_password(db: dict, username: str,
+                     old_pw: str, new_pw: str) -> tuple:
+    ok, _ = _authenticate(db, username, old_pw)
+    if not ok:
+        return False, "Senha atual incorreta."
+    if len(new_pw) < 6:
+        return False, "Nova senha deve ter ao menos 6 caracteres."
+    db["users"][username]["password_hash"] = _hash_pw(new_pw)
+    _save_auth_db(db)
+    return True, "Senha alterada com sucesso!"
 
-def auth_check_supabase() -> bool:
-    """Returns True if Supabase is available for auth."""
-    sb = _get_supabase()
-    return sb is not None
 
+# ─────────────────────────────────────────────────────────────────────────────
 
 def render_login_page() -> bool:
-    """Show login/register UI. Returns True if user is authenticated."""
-    # Already logged in?
+    """Gate: returns True if user is authenticated. Shows setup/login otherwise."""
     if st.session_state.get("auth_user"):
         return True
 
+    db = _load_auth_db()
+
+    # ── FIRST RUN: no users exist → create admin account ─────────────────────
+    if not db["users"]:
+        st.markdown("""
+        <div style="max-width:440px;margin:60px auto;padding:2rem;
+        border-radius:16px;box-shadow:0 4px 24px #0002;background:#fff;">
+        <h2 style="color:#003366;text-align:center">CitacaoIA</h2>
+        <p style="color:#e07b00;text-align:center;font-weight:600">
+        Primeiro acesso — configure o administrador</p>
+        """, unsafe_allow_html=True)
+
+        st.info("Nenhum usuario cadastrado. Crie a conta de administrador para comecar.")
+        adm_u  = st.text_input("Usuario do administrador", key="setup_u",
+                                placeholder="min. 3 caracteres")
+        adm_p  = st.text_input("Senha", key="setup_p", type="password",
+                                placeholder="min. 6 caracteres")
+        adm_p2 = st.text_input("Confirmar senha", key="setup_p2", type="password")
+
+        if st.button("Criar conta de administrador", type="primary",
+                     use_container_width=True, key="btn_setup"):
+            if adm_p != adm_p2:
+                st.error("As senhas nao coincidem.")
+            else:
+                ok, msg = _register_user(db, adm_u, adm_p, "SYSTEM", role="admin")
+                if ok:
+                    st.success("Administrador criado! Faca login abaixo.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+        return False
+
+    # ── NORMAL LOGIN ──────────────────────────────────────────────────────────
     st.markdown("""
-    <div style="max-width:420px;margin:80px auto 0 auto;padding:2rem;
-    border-radius:16px;box-shadow:0 4px 24px #0001;background:#fff;">
-    <h2 style="color:#003366;text-align:center;margin-bottom:0.2rem">CitacaoIA</h2>
-    <p style="color:#888;text-align:center;font-size:0.9rem;margin-bottom:1.5rem">
+    <div style="max-width:420px;margin:70px auto;padding:2rem;
+    border-radius:16px;box-shadow:0 4px 24px #0002;background:#fff;">
+    <h2 style="color:#003366;text-align:center;margin-bottom:.2rem">CitacaoIA</h2>
+    <p style="color:#888;text-align:center;font-size:.9rem;margin-bottom:1.5rem">
     Gestor Inteligente de Citacoes</p>
     """, unsafe_allow_html=True)
 
     tab_login, tab_reg = st.tabs(["Entrar", "Criar conta (convite)"])
 
-    db = _load_auth_db()
-
     with tab_login:
-        u = st.text_input("Usuario", key="login_u", placeholder="seu.usuario")
+        u = st.text_input("Usuario", key="login_u")
         p = st.text_input("Senha",   key="login_p", type="password")
         if st.button("Entrar", type="primary", use_container_width=True, key="btn_login"):
             ok, role_or_msg = _authenticate(db, u, p)
@@ -247,22 +265,19 @@ def render_login_page() -> bool:
                 st.error(role_or_msg)
 
     with tab_reg:
-        st.caption("Voce recebeu um codigo de convite? Crie sua conta aqui.")
-        inv  = st.text_input("Codigo de convite", key="reg_inv",
-                              placeholder="XXXXXXXX").strip().upper()
-        nu   = st.text_input("Escolha um usuario", key="reg_u",
-                              placeholder="min. 3 caracteres")
-        np   = st.text_input("Crie uma senha",  key="reg_p",
-                              type="password", placeholder="min. 6 caracteres")
-        np2  = st.text_input("Confirme a senha", key="reg_p2", type="password")
+        st.caption("Voce recebeu um codigo de convite do administrador? Crie sua conta aqui.")
+        inv = st.text_input("Codigo de convite", key="reg_inv",
+                             placeholder="Ex: A3F7B2C1").strip().upper()
+        nu  = st.text_input("Escolha um usuario", key="reg_u")
+        np  = st.text_input("Crie uma senha",  key="reg_p", type="password")
+        np2 = st.text_input("Confirme a senha", key="reg_p2", type="password")
         if st.button("Criar conta", type="primary", use_container_width=True, key="btn_reg"):
             if np != np2:
                 st.error("As senhas nao coincidem.")
             else:
                 ok, msg = _register_user(db, nu, np, inv)
                 if ok:
-                    st.success(msg)
-                    st.info("Agora faca login na aba 'Entrar'.")
+                    st.success(msg + " Faca login na aba 'Entrar'.")
                 else:
                     st.error(msg)
 
@@ -271,83 +286,113 @@ def render_login_page() -> bool:
 
 
 def render_admin_panel():
-    """Admin-only settings panel: user management, invite codes, usage logs."""
+    """Admin-only panel: users, invite codes, usage log."""
     st.markdown("---")
     with st.expander("Painel do Administrador", expanded=False):
         db  = _load_auth_db()
         log = _load_usage_log()
+        auth_user = st.session_state.get("auth_user", "admin")
 
-        admin_tab1, admin_tab2, admin_tab3 = st.tabs(
-            ["Usuarios", "Codigos de Convite", "Log de Uso"]
+        a_tab1, a_tab2, a_tab3, a_tab4 = st.tabs(
+            ["Usuarios", "Convidar Usuario", "Log de Uso", "Minha Conta"]
         )
 
-        with admin_tab1:
-            st.markdown("**Usuarios cadastrados**")
+        # ── TAB 1: Users ──────────────────────────────────────────────────────
+        with a_tab1:
+            import pandas as _pd
             users_data = [
-                {"Usuario": u, "Papel": d["role"],
-                 "Criado em": d.get("created_at","")[:10],
-                 "Convite usado": d.get("invite_code_used","")}
+                {"Usuario": u,
+                 "Papel":    d["role"],
+                 "Criado":   d.get("created_at","")[:10],
+                 "Convite":  d.get("invite_code_used","")}
                 for u, d in db["users"].items()
             ]
-            if users_data:
-                import pandas as _pd
-                st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
-            else:
-                st.info("Nenhum usuario cadastrado.")
+            st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
 
-            st.markdown("**Remover usuario**")
-            user_to_del = st.selectbox(
-                "Selecione o usuario para remover:",
-                [u for u in db["users"] if u != _ADMIN_USER],
-                key="del_user_sel"
-            )
-            if st.button("Remover usuario selecionado", key="btn_del_user"):
-                if user_to_del and user_to_del in db["users"]:
-                    del db["users"][user_to_del]
-                    _save_auth_db(db)
-                    st.success(f"Usuario '{user_to_del}' removido.")
-                    st.rerun()
+            all_non_admin = [u for u, d in db["users"].items() if d["role"] != "admin"]
+            if all_non_admin:
+                del_u = st.selectbox("Remover usuario:", ["— selecione —"] + all_non_admin,
+                                     key="del_u_sel")
+                if st.button("Remover", key="btn_del_u", type="secondary"):
+                    if del_u and del_u != "— selecione —":
+                        del db["users"][del_u]
+                        _save_auth_db(db)
+                        st.success(f"Usuario '{del_u}' removido.")
+                        st.rerun()
 
-        with admin_tab2:
-            st.markdown("**Gerar novo codigo de convite**")
-            col_i1, col_i2 = st.columns(2)
-            max_uses_inv = col_i1.number_input("Usos maximos", min_value=1, max_value=50, value=1, key="inv_max")
-            expires_inv  = col_i2.number_input("Validade (dias)", min_value=1, max_value=90, value=7, key="inv_exp")
-            if st.button("Gerar codigo", type="primary", key="btn_gen_inv"):
-                code = _gen_invite_code(db, st.session_state["auth_user"],
-                                         int(max_uses_inv), int(expires_inv))
-                st.success(f"Codigo gerado: **`{code}`**")
-                st.info(f"Compartilhe este codigo com o usuario. Valido por {expires_inv} dias, maximo {max_uses_inv} uso(s).")
+        # ── TAB 2: Invite ─────────────────────────────────────────────────────
+        with a_tab2:
+            st.markdown("**Gere um codigo e envie ao novo usuario.**")
+            st.caption("O usuario usa o codigo para criar login e senha proprios.")
 
-            st.markdown("**Codigos existentes**")
-            inv_data = [
-                {"Codigo": c, "Criado por": d["created_by"],
+            col_a, col_b = st.columns(2)
+            inv_uses = col_a.number_input("Usos maximos", 1, 20, 1, key="inv_u")
+            inv_days = col_b.number_input("Validade (dias)", 1, 90, 30, key="inv_d")
+
+            if st.button("Gerar codigo de convite", type="primary",
+                         use_container_width=True, key="btn_gen_inv"):
+                code = _gen_invite_code(db, auth_user, int(inv_uses), int(inv_days))
+                st.session_state["last_invite_code"] = code
+                st.rerun()
+
+            if st.session_state.get("last_invite_code"):
+                code = st.session_state["last_invite_code"]
+                st.success("Codigo gerado! Copie e envie ao usuario:")
+                st.code(code, language=None)
+                st.caption(
+                    f"Valido por {inv_days} dia(s), maximo {inv_uses} uso(s). "
+                    "O usuario acessa o app, clica em 'Criar conta (convite)' "
+                    "e usa este codigo para criar login e senha."
+                )
+
+            st.markdown("---")
+            st.markdown("**Codigos gerados anteriormente:**")
+            inv_rows = [
+                {"Codigo": c,
                  "Usos": f"{d['uses']}/{d['max_uses']}",
                  "Expira": d.get("expires_at","")[:10],
                  "Usado por": ", ".join(d.get("used_by",[]))}
                 for c, d in db["invite_codes"].items()
             ]
-            if inv_data:
+            if inv_rows:
                 import pandas as _pd2
-                st.dataframe(_pd2.DataFrame(inv_data), use_container_width=True)
+                st.dataframe(_pd2.DataFrame(inv_rows), use_container_width=True)
+            else:
+                st.info("Nenhum codigo gerado ainda.")
 
-        with admin_tab3:
-            st.markdown("**Log de uso (ultimas 200 acoes)**")
+        # ── TAB 3: Usage log ──────────────────────────────────────────────────
+        with a_tab3:
             if log:
                 import pandas as _pd3
-                df_log = _pd3.DataFrame(log[-200:][::-1])
-                df_log.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
-                # Filter by user
-                users_in_log = ["Todos"] + sorted(df_log["Usuario"].unique().tolist())
-                filt_u = st.selectbox("Filtrar por usuario:", users_in_log, key="log_filt")
-                if filt_u != "Todos":
-                    df_log = df_log[df_log["Usuario"] == filt_u]
-                st.dataframe(df_log, use_container_width=True)
-                csv_bytes = df_log.to_csv(index=False).encode()
-                st.download_button("Exportar CSV", data=csv_bytes,
-                                   file_name="usage_log.csv", mime="text/csv")
+                df = _pd3.DataFrame(log[-500:][::-1])
+                df.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
+                opts = ["Todos"] + sorted(df["Usuario"].unique().tolist())
+                filt = st.selectbox("Filtrar por usuario:", opts, key="log_filt")
+                if filt != "Todos":
+                    df = df[df["Usuario"] == filt]
+                st.dataframe(df, use_container_width=True)
+                st.download_button("Exportar CSV",
+                                   data=df.to_csv(index=False).encode(),
+                                   file_name="usage_log.csv", mime="text/csv",
+                                   key="dl_log_csv")
             else:
                 st.info("Nenhuma acao registrada ainda.")
+
+        # ── TAB 4: Change password ────────────────────────────────────────────
+        with a_tab4:
+            st.markdown("**Alterar minha senha**")
+            old_pw  = st.text_input("Senha atual", type="password", key="chpw_old")
+            new_pw  = st.text_input("Nova senha",  type="password", key="chpw_new")
+            new_pw2 = st.text_input("Confirmar nova senha", type="password", key="chpw_new2")
+            if st.button("Alterar senha", key="btn_chpw"):
+                if new_pw != new_pw2:
+                    st.error("As novas senhas nao coincidem.")
+                else:
+                    ok, msg = _change_password(db, auth_user, old_pw, new_pw)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
 # =============================================================================
 # BIBLIOTECA  (Supabase quando disponivel, JSON local como fallback)
@@ -1789,281 +1834,6 @@ def render_sidebar():
             st.caption(f"Arquivo: {BIBLIOTECA_FILE}")
     return api_key, provider, model
 
-
-# =============================================================================
-# AUTENTICACAO — Login / Registro / Admin / Log de uso
-# =============================================================================
-import hashlib as _hashlib
-import uuid    as _uuid
-
-# ── Supabase tables required:
-#   users(id uuid pk, username text unique, password_hash text, role text,
-#         created_at timestamptz, invite_code text)
-#   invite_codes(code text pk, created_at timestamptz, used_by text, used_at timestamptz,
-#                max_uses int, uses int, expires_at timestamptz)
-#   usage_logs(id uuid pk, username text, feature text, detail text, ts timestamptz)
-# ── Fallback: JSON files in outputs dir (for local use / no Supabase)
-
-import os as _os, json as _json_auth
-_AUTH_FILE  = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "auth_db.json")
-_USAGE_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "usage_log.json")
-_ADMIN_USER = "admin"          # hardcoded initial admin username
-
-
-def _hash_pw(pw: str) -> str:
-    return _hashlib.sha256(pw.encode()).hexdigest()
-
-
-def _load_auth_db() -> dict:
-    if _os.path.exists(_AUTH_FILE):
-        with open(_AUTH_FILE, "r") as f:
-            return _json_auth.load(f)
-    # Default: create admin with temp password "admin123" and one invite code
-    db = {
-        "users": {
-            _ADMIN_USER: {
-                "password_hash": _hash_pw("admin123"),
-                "role": "admin",
-                "created_at": "",
-                "invite_code_used": "SYSTEM"
-            }
-        },
-        "invite_codes": {},
-        "settings": {}
-    }
-    _save_auth_db(db)
-    return db
-
-
-def _save_auth_db(db: dict):
-    with open(_AUTH_FILE, "w") as f:
-        _json_auth.dump(db, f, indent=2)
-
-
-def _load_usage_log() -> list:
-    if _os.path.exists(_USAGE_FILE):
-        with open(_USAGE_FILE, "r") as f:
-            return _json_auth.load(f)
-    return []
-
-
-def _append_usage_log(username: str, feature: str, detail: str = ""):
-    log = _load_usage_log()
-    log.append({
-        "username": username,
-        "feature":  feature,
-        "detail":   detail,
-        "ts":       __import__("datetime").datetime.now().isoformat()
-    })
-    with open(_USAGE_FILE, "w") as f:
-        _json_auth.dump(log[-2000:], f, indent=2)   # keep last 2000 entries
-
-
-def _gen_invite_code(db: dict, created_by: str, max_uses: int = 1,
-                     expires_days: int = 7) -> str:
-    from datetime import datetime, timedelta
-    code = str(_uuid.uuid4())[:8].upper()
-    db["invite_codes"][code] = {
-        "created_by":  created_by,
-        "created_at":  datetime.now().isoformat(),
-        "max_uses":    max_uses,
-        "uses":        0,
-        "expires_at":  (datetime.now() + timedelta(days=expires_days)).isoformat(),
-        "used_by":     []
-    }
-    _save_auth_db(db)
-    return code
-
-
-def _validate_invite(db: dict, code: str) -> tuple:
-    """Returns (ok: bool, message: str)"""
-    from datetime import datetime
-    if code not in db["invite_codes"]:
-        return False, "Codigo de convite invalido."
-    inv = db["invite_codes"][code]
-    if inv["uses"] >= inv["max_uses"]:
-        return False, "Codigo ja foi utilizado o numero maximo de vezes."
-    if datetime.fromisoformat(inv["expires_at"]) < datetime.now():
-        return False, "Codigo de convite expirado."
-    return True, "OK"
-
-
-def _register_user(db: dict, username: str, password: str, invite_code: str) -> tuple:
-    username = username.strip().lower()
-    if not username or len(username) < 3:
-        return False, "Nome de usuario deve ter ao menos 3 caracteres."
-    if not password or len(password) < 6:
-        return False, "Senha deve ter ao menos 6 caracteres."
-    if username in db["users"]:
-        return False, "Nome de usuario ja existe."
-    ok, msg = _validate_invite(db, invite_code)
-    if not ok:
-        return False, msg
-    db["users"][username] = {
-        "password_hash":  _hash_pw(password),
-        "role":           "user",
-        "created_at":     __import__("datetime").datetime.now().isoformat(),
-        "invite_code_used": invite_code
-    }
-    db["invite_codes"][invite_code]["uses"] += 1
-    db["invite_codes"][invite_code]["used_by"].append(username)
-    _save_auth_db(db)
-    return True, "Conta criada com sucesso!"
-
-
-def _authenticate(db: dict, username: str, password: str) -> tuple:
-    username = username.strip().lower()
-    user = db["users"].get(username)
-    if not user:
-        return False, "Usuario nao encontrado."
-    if user["password_hash"] != _hash_pw(password):
-        return False, "Senha incorreta."
-    return True, user["role"]
-
-
-# ── Supabase wrappers (use local fallback if Supabase not configured) ──────
-
-def auth_check_supabase() -> bool:
-    """Returns True if Supabase is available for auth."""
-    sb = _get_supabase()
-    return sb is not None
-
-
-def render_login_page() -> bool:
-    """Show login/register UI. Returns True if user is authenticated."""
-    # Already logged in?
-    if st.session_state.get("auth_user"):
-        return True
-
-    st.markdown("""
-    <div style="max-width:420px;margin:80px auto 0 auto;padding:2rem;
-    border-radius:16px;box-shadow:0 4px 24px #0001;background:#fff;">
-    <h2 style="color:#003366;text-align:center;margin-bottom:0.2rem">CitacaoIA</h2>
-    <p style="color:#888;text-align:center;font-size:0.9rem;margin-bottom:1.5rem">
-    Gestor Inteligente de Citacoes</p>
-    """, unsafe_allow_html=True)
-
-    tab_login, tab_reg = st.tabs(["Entrar", "Criar conta (convite)"])
-
-    db = _load_auth_db()
-
-    with tab_login:
-        u = st.text_input("Usuario", key="login_u", placeholder="seu.usuario")
-        p = st.text_input("Senha",   key="login_p", type="password")
-        if st.button("Entrar", type="primary", use_container_width=True, key="btn_login"):
-            ok, role_or_msg = _authenticate(db, u, p)
-            if ok:
-                st.session_state["auth_user"] = u.strip().lower()
-                st.session_state["auth_role"] = role_or_msg
-                _append_usage_log(u.strip().lower(), "login")
-                st.rerun()
-            else:
-                st.error(role_or_msg)
-
-    with tab_reg:
-        st.caption("Voce recebeu um codigo de convite? Crie sua conta aqui.")
-        inv  = st.text_input("Codigo de convite", key="reg_inv",
-                              placeholder="XXXXXXXX").strip().upper()
-        nu   = st.text_input("Escolha um usuario", key="reg_u",
-                              placeholder="min. 3 caracteres")
-        np   = st.text_input("Crie uma senha",  key="reg_p",
-                              type="password", placeholder="min. 6 caracteres")
-        np2  = st.text_input("Confirme a senha", key="reg_p2", type="password")
-        if st.button("Criar conta", type="primary", use_container_width=True, key="btn_reg"):
-            if np != np2:
-                st.error("As senhas nao coincidem.")
-            else:
-                ok, msg = _register_user(db, nu, np, inv)
-                if ok:
-                    st.success(msg)
-                    st.info("Agora faca login na aba 'Entrar'.")
-                else:
-                    st.error(msg)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-    return False
-
-
-def render_admin_panel():
-    """Admin-only settings panel: user management, invite codes, usage logs."""
-    st.markdown("---")
-    with st.expander("Painel do Administrador", expanded=False):
-        db  = _load_auth_db()
-        log = _load_usage_log()
-
-        admin_tab1, admin_tab2, admin_tab3 = st.tabs(
-            ["Usuarios", "Codigos de Convite", "Log de Uso"]
-        )
-
-        with admin_tab1:
-            st.markdown("**Usuarios cadastrados**")
-            users_data = [
-                {"Usuario": u, "Papel": d["role"],
-                 "Criado em": d.get("created_at","")[:10],
-                 "Convite usado": d.get("invite_code_used","")}
-                for u, d in db["users"].items()
-            ]
-            if users_data:
-                import pandas as _pd
-                st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
-            else:
-                st.info("Nenhum usuario cadastrado.")
-
-            st.markdown("**Remover usuario**")
-            user_to_del = st.selectbox(
-                "Selecione o usuario para remover:",
-                [u for u in db["users"] if u != _ADMIN_USER],
-                key="del_user_sel"
-            )
-            if st.button("Remover usuario selecionado", key="btn_del_user"):
-                if user_to_del and user_to_del in db["users"]:
-                    del db["users"][user_to_del]
-                    _save_auth_db(db)
-                    st.success(f"Usuario '{user_to_del}' removido.")
-                    st.rerun()
-
-        with admin_tab2:
-            st.markdown("**Gerar novo codigo de convite**")
-            col_i1, col_i2 = st.columns(2)
-            max_uses_inv = col_i1.number_input("Usos maximos", min_value=1, max_value=50, value=1, key="inv_max")
-            expires_inv  = col_i2.number_input("Validade (dias)", min_value=1, max_value=90, value=7, key="inv_exp")
-            if st.button("Gerar codigo", type="primary", key="btn_gen_inv"):
-                code = _gen_invite_code(db, st.session_state["auth_user"],
-                                         int(max_uses_inv), int(expires_inv))
-                st.success(f"Codigo gerado: **`{code}`**")
-                st.info(f"Compartilhe este codigo com o usuario. Valido por {expires_inv} dias, maximo {max_uses_inv} uso(s).")
-
-            st.markdown("**Codigos existentes**")
-            inv_data = [
-                {"Codigo": c, "Criado por": d["created_by"],
-                 "Usos": f"{d['uses']}/{d['max_uses']}",
-                 "Expira": d.get("expires_at","")[:10],
-                 "Usado por": ", ".join(d.get("used_by",[]))}
-                for c, d in db["invite_codes"].items()
-            ]
-            if inv_data:
-                import pandas as _pd2
-                st.dataframe(_pd2.DataFrame(inv_data), use_container_width=True)
-
-        with admin_tab3:
-            st.markdown("**Log de uso (ultimas 200 acoes)**")
-            if log:
-                import pandas as _pd3
-                df_log = _pd3.DataFrame(log[-200:][::-1])
-                df_log.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
-                # Filter by user
-                users_in_log = ["Todos"] + sorted(df_log["Usuario"].unique().tolist())
-                filt_u = st.selectbox("Filtrar por usuario:", users_in_log, key="log_filt")
-                if filt_u != "Todos":
-                    df_log = df_log[df_log["Usuario"] == filt_u]
-                st.dataframe(df_log, use_container_width=True)
-                csv_bytes = df_log.to_csv(index=False).encode()
-                st.download_button("Exportar CSV", data=csv_bytes,
-                                   file_name="usage_log.csv", mime="text/csv")
-            else:
-                st.info("Nenhuma acao registrada ainda.")
-
-# =============================================================================
 # BIBLIOTECA TAB
 # =============================================================================
 
