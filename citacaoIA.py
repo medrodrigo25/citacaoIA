@@ -2244,51 +2244,6 @@ def render_citar_tab():
 
     st.divider()
 
-    # ── Background processing status ──────────────────────────────────────────
-    active_task_id = st.session_state.get("pipeline_task_id")
-    if active_task_id and active_task_id in _PIPELINE_TASKS:
-        task   = _PIPELINE_TASKS[active_task_id]
-        status = task.get("status", "running")
-        pct    = task.get("progress", 0)
-        msg    = task.get("msg", "Processando...")
-
-        st.progress(pct / 100, text=f"**{msg}**")
-
-        if status == "running":
-            col_info, col_cancel = st.columns([4, 1])
-            col_info.info(
-                "Processando em segundo plano — voce pode navegar entre as abas normalmente."
-            )
-            if col_cancel.button("Cancelar", key="btn_cancel_pipe"):
-                task["cancelled"] = True
-                del st.session_state["pipeline_task_id"]
-                st.rerun()
-            time.sleep(0.8)
-            st.rerun()
-
-        elif status == "done":
-            result, all_refs, final_ref_list = task["result"]
-            st.session_state["last_citation_style"] = task.get("citation_style", "Vancouver")
-            st.session_state["last_result"]     = result
-            st.session_state["last_all_refs"]   = all_refs
-            st.session_state["last_final_refs"] = final_ref_list
-            st.session_state["last_mode"]       = task.get("mode", "add")
-            del st.session_state["pipeline_task_id"]
-            _PIPELINE_TASKS.pop(active_task_id, None)
-            st.rerun()
-
-        elif status in ("error", "cancelled"):
-            if status == "error":
-                st.error(f"Erro no processamento: {task.get('error', 'Erro desconhecido')}")
-                with st.expander("Detalhes tecnicos"):
-                    st.code(task.get("traceback", ""))
-            else:
-                st.warning("Processamento cancelado.")
-            del st.session_state["pipeline_task_id"]
-            _PIPELINE_TASKS.pop(active_task_id, None)
-
-        return  # don't show button while a task is active
-
     run_btn = st.button("Processar texto com IA", type="primary",
                         use_container_width=True, disabled=not api_key)
 
@@ -2316,28 +2271,35 @@ def render_citar_tab():
             st.error("Configure a chave de API na barra lateral.")
             return
 
-        # Read uploaded file bytes NOW (before thread — UploadedFile is not thread-safe)
-        ref_bytes = [(f.name, f.read()) for f in ref_files] if ref_files else []
-        manual_refs = parse_manual_refs(manual_ref_text) if manual_ref_text.strip() else []
+        # Parse manual refs if provided
+        extra_refs = parse_manual_refs(manual_ref_text) if manual_ref_text.strip() else []
+        # Prepend manual refs to library_refs so they are always included
+        combined_library = extra_refs + library_refs
 
-        task_id = f"pipe_{time.time():.0f}"
-        _PIPELINE_TASKS[task_id] = {
-            "status":         "running",
-            "progress":       0,
-            "msg":            "Iniciando...",
-            "citation_style": citation_style,
-            "mode":           mode_key,
-        }
-        st.session_state["pipeline_task_id"] = task_id
+        try:
+            client = get_ai_client(provider, api_key)
+        except Exception as e:
+            st.error(f"Erro ao inicializar cliente IA: {e}")
+            return
 
-        client_cfg = {"api_key": api_key, "model": model}
-        t = _threading.Thread(
-            target=_pipeline_worker,
-            args=(task_id, provider, client_cfg, main_text, ref_bytes,
-                  mode_key, library_refs, citation_style, manual_refs),
-            daemon=True,
-        )
-        t.start()
+        try:
+            result, all_refs, final_ref_list = run_pipeline(
+                client, provider, model, main_text,
+                ref_files if ref_files else [],
+                mode_key, combined_library, citation_style
+            )
+        except Exception as e:
+            import traceback as _tb
+            st.error(f"Erro no processamento: {e}")
+            with st.expander("Detalhes do erro"):
+                st.code(_tb.format_exc())
+            return
+
+        st.session_state["last_citation_style"] = citation_style
+        st.session_state["last_result"]         = result
+        st.session_state["last_all_refs"]        = all_refs
+        st.session_state["last_final_refs"]      = final_ref_list
+        st.session_state["last_mode"]            = mode_key
         st.rerun()
 
     _lr = st.session_state.get("last_result")
