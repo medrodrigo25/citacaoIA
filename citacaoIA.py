@@ -3123,50 +3123,124 @@ def render_verificar_refs_tab():
 # =============================================================================
 
 def convert_file_to_markdown(file_bytes: bytes, filename: str) -> str:
-    """Convert PDF or DOCX to Markdown text."""
+    """Convert PDF or DOCX to clean Markdown with heading detection and paragraph joining."""
+    import re as _re
     fn = filename.lower()
+
     if fn.endswith(".pdf"):
-        # Use PyMuPDF
         try:
             import fitz
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            pages = []
-            for i, page in enumerate(doc, 1):
-                text = page.get_text("text")
-                if text.strip():
-                    pages.append(f"<!-- Page {i} -->\n{text.strip()}")
+
+            # Pass 1: find body font size (most common size across all spans)
+            all_sizes = []
+            for page in doc:
+                for block in page.get_text("dict")["blocks"]:
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            if span["text"].strip():
+                                all_sizes.append(round(span["size"], 1))
+            if not all_sizes:
+                doc.close()
+                return "Nenhum texto encontrado no PDF."
+
+            from collections import Counter
+            body_size = Counter(all_sizes).most_common(1)[0][0]
+
+            def _hlevel(size):
+                d = size - body_size
+                if d >= 6:   return 1
+                if d >= 3:   return 2
+                if d >= 1.5: return 3
+                return 0
+
+            # Pass 2: build Markdown page by page
+            md_parts = []
+            for page in doc:
+                page_md = []
+                para_buf = []
+
+                def flush():
+                    if para_buf:
+                        joined = " ".join(para_buf)
+                        joined = _re.sub(r" +", " ", joined).strip()
+                        # Split on sentence boundaries for readability
+                        joined = _re.sub(r"([.!?]) ([A-ZÁÀÂÃÉÊÍÓÔÕÚÜÇ])",
+                                         r"\1\n\n\2", joined)
+                        if joined:
+                            page_md.append(joined)
+                        para_buf.clear()
+
+                for block in page.get_text("dict")["blocks"]:
+                    if block.get("type") != 0:
+                        continue
+                    for line in block.get("lines", []):
+                        spans     = line.get("spans", [])
+                        line_text = " ".join(s["text"] for s in spans).strip()
+                        if not line_text:
+                            continue
+                        max_size = max((s["size"] for s in spans), default=body_size)
+                        is_bold  = any(s.get("flags", 0) & 16 for s in spans)
+                        level    = _hlevel(max_size)
+                        # Bold short lines → subheading
+                        if level == 0 and is_bold and len(line_text) < 120:
+                            level = 3
+                        # "24.1 Title" pattern → subheading
+                        if level == 0 and _re.match(r"^\d+\.\d*\s+\S", line_text) \
+                                and len(line_text) < 120:
+                            level = 2
+                        if level > 0:
+                            flush()
+                            page_md.append("#" * level + " " + line_text)
+                        else:
+                            # Strip soft hyphen at end of wrapped line
+                            cleaned = _re.sub(r"-$", "", line_text.rstrip())
+                            para_buf.append(cleaned)
+
+                    flush()  # flush after each block
+
+                if page_md:
+                    md_parts.append("\n\n".join(page_md))
+
             doc.close()
-            return "\n\n---\n\n".join(pages)
+            full = "\n\n---\n\n".join(md_parts)
+            full = _re.sub(r"\n{3,}", "\n\n", full)
+            return full
+
         except Exception as e:
-            return f"Erro ao converter PDF: {e}"
+            import traceback as _tb
+            return f"Erro ao converter PDF: {e}\n{_tb.format_exc()}"
+
     elif fn.endswith(".docx"):
         try:
-            from docx import Document as DocxDoc
-            from io import BytesIO
-            doc = DocxDoc(BytesIO(file_bytes))
-            lines = []
+            from docx import Document as _DocxDoc
+            doc   = _DocxDoc(BytesIO(file_bytes))
+            lines_out = []
             for para in doc.paragraphs:
                 style = para.style.name.lower()
                 text  = para.text.strip()
                 if not text:
-                    lines.append("")
+                    lines_out.append("")
                     continue
                 if "heading 1" in style or "titulo 1" in style:
-                    lines.append(f"# {text}")
+                    lines_out.append(f"# {text}")
                 elif "heading 2" in style or "titulo 2" in style:
-                    lines.append(f"## {text}")
+                    lines_out.append(f"## {text}")
                 elif "heading 3" in style or "titulo 3" in style:
-                    lines.append(f"### {text}")
-                elif "list" in style or "bullet" in style:
-                    lines.append(f"- {text}")
+                    lines_out.append(f"### {text}")
+                elif "list" in style or "bullet" in style or "lista" in style:
+                    lines_out.append(f"- {text}")
+                elif para.runs and all(r.bold for r in para.runs if r.text.strip()):
+                    lines_out.append(f"## {text}")
                 else:
-                    lines.append(text)
-            return "\n\n".join(lines)
+                    lines_out.append(text)
+            import re as _re2
+            md = "\n\n".join(lines_out)
+            return _re2.sub(r"\n{3,}", "\n\n", md)
         except Exception as e:
             return f"Erro ao converter DOCX: {e}"
     else:
         return file_bytes.decode("utf-8", errors="replace")
-
 
 def render_converter_tab():
     st.markdown("### Converter Documentos para Markdown (.md)")
