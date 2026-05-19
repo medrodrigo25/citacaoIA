@@ -93,11 +93,30 @@ def _hash_pw(pw: str) -> str:
 
 
 def _load_auth_db() -> dict:
+    """Load auth DB. Supports ADMIN_RESET env var to force recreate admin."""
+    import os as _os2
+    reset_pw = _os2.environ.get("ADMIN_RESET_PASSWORD", "").strip()
+
+    db = {"users": {}, "invite_codes": {}}
     if _os.path.exists(_AUTH_FILE):
-        with open(_AUTH_FILE, "r") as f:
-            return _json_auth.load(f)
-    # Empty DB — first run, no admin yet
-    return {"users": {}, "invite_codes": {}}
+        try:
+            with open(_AUTH_FILE, "r") as f:
+                db = _json_auth.load(f)
+        except Exception:
+            db = {"users": {}, "invite_codes": {}}
+
+    # If ADMIN_RESET_PASSWORD is set in env, force-reset or create admin
+    if reset_pw:
+        admin_u = _os2.environ.get("ADMIN_RESET_USER", "admin").strip()
+        db["users"][admin_u] = {
+            "password_hash":    _hash_pw(reset_pw),
+            "role":             "admin",
+            "created_at":       __import__("datetime").datetime.now().isoformat(),
+            "invite_code_used": "ENV_RESET"
+        }
+        _save_auth_db(db)
+
+    return db
 
 
 def _save_auth_db(db: dict):
@@ -241,6 +260,9 @@ def render_login_page() -> bool:
         return False
 
     # ── NORMAL LOGIN ──────────────────────────────────────────────────────────
+    import os as _os3
+    _reset_active = bool(_os3.environ.get("ADMIN_RESET_PASSWORD","").strip())
+
     st.markdown("""
     <div style="max-width:420px;margin:70px auto;padding:2rem;
     border-radius:16px;box-shadow:0 4px 24px #0002;background:#fff;">
@@ -248,6 +270,9 @@ def render_login_page() -> bool:
     <p style="color:#888;text-align:center;font-size:.9rem;margin-bottom:1.5rem">
     Gestor Inteligente de Citacoes</p>
     """, unsafe_allow_html=True)
+    if _reset_active:
+        _ru = _os3.environ.get("ADMIN_RESET_USER","admin")
+        st.warning(f"Modo reset ativo — use usuario **{_ru}** e a senha definida em ADMIN_RESET_PASSWORD.")
 
     tab_login, tab_reg = st.tabs(["Entrar", "Criar conta (convite)"])
 
