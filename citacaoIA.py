@@ -311,113 +311,112 @@ def render_login_page() -> bool:
 
 
 def render_admin_panel():
-    """Admin-only panel: users, invite codes, usage log."""
-    st.markdown("---")
-    with st.expander("Painel do Administrador", expanded=False):
-        db  = _load_auth_db()
-        log = _load_usage_log()
-        auth_user = st.session_state.get("auth_user", "admin")
+    """Admin-only full-page panel: users, invite codes, usage log, settings."""
+    st.markdown("## Configuracoes do Administrador")
+    db  = _load_auth_db()
+    log = _load_usage_log()
+    auth_user = st.session_state.get("auth_user", "admin")
 
-        a_tab1, a_tab2, a_tab3, a_tab4 = st.tabs(
-            ["Usuarios", "Convidar Usuario", "Log de Uso", "Minha Conta"]
-        )
+    a_tab1, a_tab2, a_tab3, a_tab4 = st.tabs(
+    ["Usuarios", "Convidar Usuario", "Log de Uso", "Minha Conta"]
+    )
 
-        # ── TAB 1: Users ──────────────────────────────────────────────────────
-        with a_tab1:
-            import pandas as _pd
-            users_data = [
-                {"Usuario": u,
-                 "Papel":    d["role"],
-                 "Criado":   d.get("created_at","")[:10],
-                 "Convite":  d.get("invite_code_used","")}
-                for u, d in db["users"].items()
-            ]
-            st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
+    # ── TAB 1: Users ──────────────────────────────────────────────────────
+    with a_tab1:
+        import pandas as _pd
+        users_data = [
+            {"Usuario": u,
+             "Papel":    d["role"],
+             "Criado":   d.get("created_at","")[:10],
+             "Convite":  d.get("invite_code_used","")}
+            for u, d in db["users"].items()
+        ]
+        st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
 
-            all_non_admin = [u for u, d in db["users"].items() if d["role"] != "admin"]
-            if all_non_admin:
-                del_u = st.selectbox("Remover usuario:", ["— selecione —"] + all_non_admin,
-                                     key="del_u_sel")
-                if st.button("Remover", key="btn_del_u", type="secondary"):
-                    if del_u and del_u != "— selecione —":
-                        del db["users"][del_u]
-                        _save_auth_db(db)
-                        st.success(f"Usuario '{del_u}' removido.")
-                        st.rerun()
+        all_non_admin = [u for u, d in db["users"].items() if d["role"] != "admin"]
+        if all_non_admin:
+            del_u = st.selectbox("Remover usuario:", ["— selecione —"] + all_non_admin,
+                                 key="del_u_sel")
+            if st.button("Remover", key="btn_del_u", type="secondary"):
+                if del_u and del_u != "— selecione —":
+                    del db["users"][del_u]
+                    _save_auth_db(db)
+                    st.success(f"Usuario '{del_u}' removido.")
+                    st.rerun()
 
-        # ── TAB 2: Invite ─────────────────────────────────────────────────────
-        with a_tab2:
-            st.markdown("**Gere um codigo e envie ao novo usuario.**")
-            st.caption("O usuario usa o codigo para criar login e senha proprios.")
+    # ── TAB 2: Invite ─────────────────────────────────────────────────────
+    with a_tab2:
+        st.markdown("**Gere um codigo e envie ao novo usuario.**")
+        st.caption("O usuario usa o codigo para criar login e senha proprios.")
 
-            col_a, col_b = st.columns(2)
-            inv_uses = col_a.number_input("Usos maximos", 1, 20, 1, key="inv_u")
-            inv_days = col_b.number_input("Validade (dias)", 1, 90, 30, key="inv_d")
+        col_a, col_b = st.columns(2)
+        inv_uses = col_a.number_input("Usos maximos", 1, 20, 1, key="inv_u")
+        inv_days = col_b.number_input("Validade (dias)", 1, 90, 30, key="inv_d")
 
-            if st.button("Gerar codigo de convite", type="primary",
-                         use_container_width=True, key="btn_gen_inv"):
-                code = _gen_invite_code(db, auth_user, int(inv_uses), int(inv_days))
-                st.session_state["last_invite_code"] = code
-                st.rerun()
+        if st.button("Gerar codigo de convite", type="primary",
+                     use_container_width=True, key="btn_gen_inv"):
+            code = _gen_invite_code(db, auth_user, int(inv_uses), int(inv_days))
+            st.session_state["last_invite_code"] = code
+            st.rerun()
 
-            if st.session_state.get("last_invite_code"):
-                code = st.session_state["last_invite_code"]
-                st.success("Codigo gerado! Copie e envie ao usuario:")
-                st.code(code, language=None)
-                st.caption(
-                    f"Valido por {inv_days} dia(s), maximo {inv_uses} uso(s). "
-                    "O usuario acessa o app, clica em 'Criar conta (convite)' "
-                    "e usa este codigo para criar login e senha."
-                )
+        if st.session_state.get("last_invite_code"):
+            code = st.session_state["last_invite_code"]
+            st.success("Codigo gerado! Copie e envie ao usuario:")
+            st.code(code, language=None)
+            st.caption(
+                f"Valido por {inv_days} dia(s), maximo {inv_uses} uso(s). "
+                "O usuario acessa o app, clica em 'Criar conta (convite)' "
+                "e usa este codigo para criar login e senha."
+            )
 
-            st.markdown("---")
-            st.markdown("**Codigos gerados anteriormente:**")
-            inv_rows = [
-                {"Codigo": c,
-                 "Usos": f"{d['uses']}/{d['max_uses']}",
-                 "Expira": d.get("expires_at","")[:10],
-                 "Usado por": ", ".join(d.get("used_by",[]))}
-                for c, d in db["invite_codes"].items()
-            ]
-            if inv_rows:
-                import pandas as _pd2
-                st.dataframe(_pd2.DataFrame(inv_rows), use_container_width=True)
+        st.markdown("---")
+        st.markdown("**Codigos gerados anteriormente:**")
+        inv_rows = [
+            {"Codigo": c,
+             "Usos": f"{d['uses']}/{d['max_uses']}",
+             "Expira": d.get("expires_at","")[:10],
+             "Usado por": ", ".join(d.get("used_by",[]))}
+            for c, d in db["invite_codes"].items()
+        ]
+        if inv_rows:
+            import pandas as _pd2
+            st.dataframe(_pd2.DataFrame(inv_rows), use_container_width=True)
+        else:
+            st.info("Nenhum codigo gerado ainda.")
+
+    # ── TAB 3: Usage log ──────────────────────────────────────────────────
+    with a_tab3:
+        if log:
+            import pandas as _pd3
+            df = _pd3.DataFrame(log[-500:][::-1])
+            df.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
+            opts = ["Todos"] + sorted(df["Usuario"].unique().tolist())
+            filt = st.selectbox("Filtrar por usuario:", opts, key="log_filt")
+            if filt != "Todos":
+                df = df[df["Usuario"] == filt]
+            st.dataframe(df, use_container_width=True)
+            st.download_button("Exportar CSV",
+                               data=df.to_csv(index=False).encode(),
+                               file_name="usage_log.csv", mime="text/csv",
+                               key="dl_log_csv")
+        else:
+            st.info("Nenhuma acao registrada ainda.")
+
+    # ── TAB 4: Change password ────────────────────────────────────────────
+    with a_tab4:
+        st.markdown("**Alterar minha senha**")
+        old_pw  = st.text_input("Senha atual", type="password", key="chpw_old")
+        new_pw  = st.text_input("Nova senha",  type="password", key="chpw_new")
+        new_pw2 = st.text_input("Confirmar nova senha", type="password", key="chpw_new2")
+        if st.button("Alterar senha", key="btn_chpw"):
+            if new_pw != new_pw2:
+                st.error("As novas senhas nao coincidem.")
             else:
-                st.info("Nenhum codigo gerado ainda.")
-
-        # ── TAB 3: Usage log ──────────────────────────────────────────────────
-        with a_tab3:
-            if log:
-                import pandas as _pd3
-                df = _pd3.DataFrame(log[-500:][::-1])
-                df.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
-                opts = ["Todos"] + sorted(df["Usuario"].unique().tolist())
-                filt = st.selectbox("Filtrar por usuario:", opts, key="log_filt")
-                if filt != "Todos":
-                    df = df[df["Usuario"] == filt]
-                st.dataframe(df, use_container_width=True)
-                st.download_button("Exportar CSV",
-                                   data=df.to_csv(index=False).encode(),
-                                   file_name="usage_log.csv", mime="text/csv",
-                                   key="dl_log_csv")
-            else:
-                st.info("Nenhuma acao registrada ainda.")
-
-        # ── TAB 4: Change password ────────────────────────────────────────────
-        with a_tab4:
-            st.markdown("**Alterar minha senha**")
-            old_pw  = st.text_input("Senha atual", type="password", key="chpw_old")
-            new_pw  = st.text_input("Nova senha",  type="password", key="chpw_new")
-            new_pw2 = st.text_input("Confirmar nova senha", type="password", key="chpw_new2")
-            if st.button("Alterar senha", key="btn_chpw"):
-                if new_pw != new_pw2:
-                    st.error("As novas senhas nao coincidem.")
+                ok, msg = _change_password(db, auth_user, old_pw, new_pw)
+                if ok:
+                    st.success(msg)
                 else:
-                    ok, msg = _change_password(db, auth_user, old_pw, new_pw)
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
+                    st.error(msg)
 
 # =============================================================================
 # BIBLIOTECA  (Supabase quando disponivel, JSON local como fallback)
@@ -4360,11 +4359,8 @@ def main():
         if k not in st.session_state:
             st.session_state[k] = None
 
-    # Admin panel (only for admin role)
-    if auth_role == "admin":
-        render_admin_panel()
-
-    tab_bib, tab_citar, tab_rev, tab_vr, tab_conv, tab_ev, tab_ppt, tab_rd = st.tabs([
+    # Build tab list — Admin tab only for admin role
+    tab_labels = [
         "\U0001f4d6 Biblioteca",
         "\u270d\ufe0f Citar Texto",
         "\U0001f4dd Revisao Editorial",
@@ -4373,23 +4369,22 @@ def main():
         "\U0001f4a1 Buscar Evidencias",
         "\U0001f4ca Referenciar PPT",
         "\U0001f3a8 Redesenhar Slide",
-    ])
-    with tab_bib:
-        render_biblioteca_tab()
-    with tab_citar:
-        render_citar_tab()
-    with tab_rev:
-        render_revisao_tab()
-    with tab_vr:
-        render_verificar_refs_tab()
-    with tab_conv:
-        render_converter_tab()
-    with tab_ev:
-        render_evidencias_tab()
-    with tab_ppt:
-        render_citar_ppt_tab()
-    with tab_rd:
-        render_redesenhar_slide_tab()
+    ]
+    if auth_role == "admin":
+        tab_labels.append("\u2699\ufe0f Configuracoes")
+
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]: render_biblioteca_tab()
+    with tabs[1]: render_citar_tab()
+    with tabs[2]: render_revisao_tab()
+    with tabs[3]: render_verificar_refs_tab()
+    with tabs[4]: render_converter_tab()
+    with tabs[5]: render_evidencias_tab()
+    with tabs[6]: render_citar_ppt_tab()
+    with tabs[7]: render_redesenhar_slide_tab()
+    if auth_role == "admin":
+        with tabs[8]: render_admin_panel()
 
     # Log active tab (lightweight — fires on every rerun, deduped by session)
     if st.session_state.get("_last_log_user") != auth_user:
