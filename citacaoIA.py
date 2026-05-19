@@ -93,28 +93,61 @@ def _hash_pw(pw: str) -> str:
 
 
 def _load_auth_db() -> dict:
-    """Load auth DB. Supports ADMIN_RESET env var to force recreate admin."""
+    """Load auth DB.
+    Priority for admin credentials (highest to lowest):
+      1. Streamlit secrets [auth] admin_user / admin_password
+      2. Environment variable ADMIN_RESET_PASSWORD / ADMIN_RESET_USER
+      3. Local auth_db.json file (persists on local installs; ephemeral on Cloud)
+    """
     import os as _os2
-    reset_pw = _os2.environ.get("ADMIN_RESET_PASSWORD", "").strip()
 
-    db = {"users": {}, "invite_codes": {}}
+    # ── Read from file (local installs) ───────────────────────────────────
+    db = {"users": {}, "invite_codes": {}, "recovery_codes": {}}
     if _os.path.exists(_AUTH_FILE):
         try:
             with open(_AUTH_FILE, "r") as f:
-                db = _json_auth.load(f)
+                loaded = _json_auth.load(f)
+                db.update(loaded)
+                if "recovery_codes" not in db:
+                    db["recovery_codes"] = {}
         except Exception:
-            db = {"users": {}, "invite_codes": {}}
+            pass
 
-    # If ADMIN_RESET_PASSWORD is set in env, force-reset or create admin
+    # ── Priority 1: Streamlit secrets [auth] ─────────────────────────────
+    # Works on Streamlit Cloud where filesystem is ephemeral.
+    # In secrets.toml add:
+    #   [auth]
+    #   admin_user     = "admin"
+    #   admin_password = "admin123"
+    try:
+        _auth_sec = st.secrets.get("auth", {})
+        sec_pw   = str(_auth_sec.get("admin_password", "")).strip()
+        sec_user = str(_auth_sec.get("admin_user", "admin")).strip()
+        if sec_pw:
+            db["users"][sec_user] = {
+                "password_hash":    _hash_pw(sec_pw),
+                "role":             "admin",
+                "created_at":       __import__("datetime").datetime.now().isoformat(),
+                "invite_code_used": "SECRETS",
+            }
+            # Do NOT save to file here — on Cloud the password comes from secrets every load
+    except Exception:
+        pass
+
+    # ── Priority 2: Environment variable (legacy / Docker / Railway) ──────
+    reset_pw = _os2.environ.get("ADMIN_RESET_PASSWORD", "").strip()
     if reset_pw:
         admin_u = _os2.environ.get("ADMIN_RESET_USER", "admin").strip()
         db["users"][admin_u] = {
             "password_hash":    _hash_pw(reset_pw),
             "role":             "admin",
             "created_at":       __import__("datetime").datetime.now().isoformat(),
-            "invite_code_used": "ENV_RESET"
+            "invite_code_used": "ENV_RESET",
         }
-        _save_auth_db(db)
+        try:
+            _save_auth_db(db)
+        except Exception:
+            pass
 
     return db
 
@@ -3457,15 +3490,238 @@ Return ONLY valid JSON (no markdown fences):
     return data if data else {"error": "Falha na busca", "raw": raw, "article": article_name}
 
 
-def render_evidencias_tab():
-    st.markdown("### Busca de Evidencias em Artigos")
-    st.caption(
-        "Insira uma afirmacao ou paragrafo e anexe um ou mais artigos (PDF). "
-        "A IA encontra e destaca os trechos que apoiam sua afirmacao.")
+def _gen_evidence_queries(client, provider, model, claim: str) -> list:
+    """Use AI to generate optimized PubMed search queries from a paragraph/claim."""
+    prompt = f"""You are a scientific literature search expert.
 
-    api_key  = st.session_state.get("_api_key","")
-    provider = st.session_state.get("_provider","")
-    model    = st.session_state.get("_model","")
+Read the paragraph below and generate 5 specific PubMed/MEDLINE search queries IN ENGLISH to find articles that support the scientific claims in it.
+
+Rules:
+- Each query should be specific and use MeSH-style terms when possible
+- Mix different angles: prevalence, mechanisms, clinical evidence, systematic reviews
+- Include "systematic review" OR "meta-analysis" in at least one query
+- All queries must be in English
+
+Return ONLY a JSON array of strings:
+["query 1","query 2","query 3","query 4","query 5"]
+
+PARAGRAPH:
+{claim[:1500]}"""
+
+    raw = ai_call(client, provider, model, prompt, max_tokens=400)
+    try:
+        m = re.search(r"\[.*?\]", raw, re.DOTALL)
+        if m:
+            queries = json.loads(m.group())
+            return [q for q in queries if isinstance(q, str) and q.strip()][:5]
+    except Exception:
+        pass
+    return []
+
+
+def _assess_abstract_evidence(client, provider, model, claim: str, article: dict) -> dict:
+    """AI assesses whether an article's abstract/title supports the claim."""
+    title    = article.get("title", "")
+    authors  = ", ".join(article.get("authors", [])[:3])
+    journal  = article.get("journal", "")
+    year     = article.get("year", "")
+    abstract = article.get("abstract", "") or article.get("_abstract", "")
+
+    content = f"Title: {title}\nAuthors: {authors}\nJournal: {journal} ({year})"
+    if abstract:
+        content += f"\nAbstract: {abstract[:2000]}"
+
+    prompt = f"""You are a scientific evidence analyst.
+
+Assess whether the article below SUPPORTS, is PARTIALLY RELEVANT, or does NOT SUPPORT the claim.
+
+CLAIM:
+{claim[:800]}
+
+ARTICLE:
+{content}
+
+Return ONLY valid JSON (no markdown):
+{{
+  "article": "{title[:80]}",
+  "overall_support": "Forte / Parcial / Fraco / Nenhum",
+  "passages": [
+    {{
+      "text": "key phrase from title/abstract that supports the claim (verbatim or near-verbatim)",
+      "relevance": "Alta/Media/Baixa",
+      "explanation": "explanation in Portuguese of why this supports the claim",
+      "location": "abstract/title"
+    }}
+  ],
+  "summary": "1-2 sentence synthesis in Portuguese",
+  "vancouver_citation": "Vancouver format: Authors. Title. Journal. Year;Vol(Issue):Pages."
+}}"""
+
+    raw  = ai_call(client, provider, model, prompt, max_tokens=1500)
+    data = extract_json_from_ai(raw)
+    if data:
+        # Inject bibliographic metadata
+        data["_meta"] = article
+        data["_doi"]  = article.get("doi", "")
+        data["_source"] = article.get("_source", "")
+        data["_pmid"]   = article.get("pmid", "")
+    return data if data else {
+        "article": title,
+        "overall_support": "Fraco",
+        "passages": [],
+        "summary": "Nao foi possivel avaliar este artigo.",
+        "_meta": article,
+    }
+
+
+def _search_evidence_online(client, provider, model, claim: str) -> list:
+    """Full online evidence search pipeline:
+    1. AI generates PubMed queries from the claim
+    2. Searches PubMed, Europe PMC, OpenAlex, LILACS
+    3. AI assesses each found abstract for support strength
+    Returns list of evidence dicts (same format as find_evidence_ai).
+    """
+    # Step 1 — generate queries
+    queries = _gen_evidence_queries(client, provider, model, claim)
+    if not queries:
+        # Fallback: use first 120 chars of claim as query
+        queries = [claim[:120]]
+
+    # Step 2 — multi-source search
+    all_articles = []
+    seen_titles  = set()
+    for q in queries:
+        hits = multi_source_search(q, max_per_source=3)
+        for h in hits:
+            t = h.get("title","").lower()[:80]
+            if t and t not in seen_titles:
+                seen_titles.add(t)
+                all_articles.append(h)
+        time.sleep(0.3)
+
+    # Limit to 10 most unique articles for assessment
+    all_articles = all_articles[:10]
+
+    if not all_articles:
+        return []
+
+    # Step 3 — AI assesses each abstract
+    results = []
+    for art in all_articles:
+        ev = _assess_abstract_evidence(client, provider, model, claim, art)
+        if ev.get("overall_support","Nenhum") not in ("Nenhum",):
+            results.append(ev)
+        time.sleep(1)  # avoid rate limit
+
+    # Sort: Forte → Parcial → Fraco
+    order = {"Forte": 0, "Parcial": 1, "Fraco": 2, "Nenhum": 3}
+    results.sort(key=lambda x: order.get(x.get("overall_support","Nenhum"), 4))
+    return results
+
+
+def _display_ev_results(ev_results: list, online_mode: bool = False):
+    """Render evidence results (shared by both local-file and online modes)."""
+    st.divider()
+    st.markdown("#### Evidencias Encontradas")
+
+    if st.session_state.get("last_ev_claim"):
+        st.info(f"**Afirmacao analisada:** {st.session_state['last_ev_claim'][:300]}")
+
+    if online_mode:
+        st.caption("🔍 Resultados obtidos por busca automatica em PubMed, Europe PMC, OpenAlex e LILACS.")
+
+    color_map = {"Forte": "🟢", "Parcial": "🟡", "Fraco": "🟠", "Nenhum": "🔴"}
+
+    for ev in ev_results:
+        if "error" in ev and "passages" not in ev:
+            st.error(f"Erro: {ev.get('error')}")
+            continue
+
+        support = ev.get("overall_support", "N/A")
+        icon    = color_map.get(support, "⚪")
+        art_label = ev.get("article", ev.get("_meta", {}).get("title", "Artigo"))[:90]
+
+        # Build expander label with journal info when online
+        meta = ev.get("_meta", {})
+        if online_mode and meta:
+            journal_line = f"{meta.get('journal','')} {meta.get('year','')}"
+            source_tag   = meta.get("_source","")
+            label = f"{icon} **{art_label}** — {support} | {journal_line} [{source_tag}]"
+        else:
+            label = f"{icon} **{art_label}** — Suporte: {support}"
+
+        with st.expander(label, expanded=(support in ("Forte","Parcial"))):
+            if ev.get("summary"):
+                st.markdown(f"*{ev['summary']}*")
+
+            # Vancouver citation (online mode)
+            if online_mode:
+                vcit = ev.get("vancouver_citation","")
+                doi  = ev.get("_doi","") or meta.get("doi","")
+                pmid = ev.get("_pmid","") or meta.get("pmid","")
+                if vcit:
+                    st.markdown(f"**Citacao Vancouver:** {vcit}")
+                links = []
+                if doi:
+                    links.append(f"[DOI: {doi}](https://doi.org/{doi})")
+                if pmid:
+                    links.append(f"[PubMed PMID {pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
+                if links:
+                    st.markdown("  ".join(links))
+
+            passages = ev.get("passages", [])
+            if not passages:
+                st.warning("Nenhum trecho de suporte encontrado.")
+                continue
+
+            for i, p in enumerate(passages, 1):
+                rel   = p.get("relevance", "")
+                loc   = f" — {p['location']}" if p.get("location") else ""
+                badge = "🟢" if rel == "Alta" else ("🟡" if rel == "Media" else "🟠")
+                st.markdown(f"**Trecho {i}** {badge} Relevancia {rel}{loc}")
+                st.markdown(
+                    f'<div class="ref-box">{p.get("text","")}</div>',
+                    unsafe_allow_html=True,
+                )
+                if p.get("explanation"):
+                    st.caption(f"Por que apoia: {p['explanation']}")
+
+    # Download report
+    if ev_results:
+        mode_label = "BUSCA ONLINE AUTOMATICA" if online_mode else "ANALISE DE ARTIGOS LOCAIS"
+        lines = [f"BUSCA DE EVIDENCIAS — {mode_label}",
+                 f"Afirmacao: {st.session_state.get('last_ev_claim','')}", ""]
+        for ev in ev_results:
+            meta = ev.get("_meta", {})
+            lines += ["", f"ARTIGO: {ev.get('article', meta.get('title',''))}"]
+            if online_mode:
+                lines.append(f"Periodico: {meta.get('journal','')} {meta.get('year','')}")
+                lines.append(f"Fonte: {meta.get('_source','')}")
+                if meta.get("doi"):
+                    lines.append(f"DOI: https://doi.org/{meta['doi']}")
+            lines += [f"Suporte geral: {ev.get('overall_support','')}", f"Resumo: {ev.get('summary','')}"]
+            for i, p in enumerate(ev.get("passages", []), 1):
+                lines += ["", f"  Trecho {i} [Relevancia {p.get('relevance','')}]:",
+                          f'  "{p.get("text","")}"', f"  -> {p.get('explanation','')}"]
+        st.download_button(
+            "📥 Baixar relatorio de evidencias (.txt)",
+            data="\n".join(lines).encode("utf-8"),
+            file_name="evidencias.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+
+def render_evidencias_tab():
+    st.markdown("### Busca de Evidencias Cientificas")
+    st.caption(
+        "Insira uma afirmacao ou paragrafo. "
+        "**Com upload de PDFs:** a IA analisa os artigos que voce forneceu. "
+        "**Sem upload:** a IA busca automaticamente em PubMed, Europe PMC, OpenAlex e LILACS.")
+
+    api_key  = st.session_state.get("_api_key", "")
+    provider = st.session_state.get("_provider", "")
+    model    = st.session_state.get("_model", "")
 
     if not api_key:
         st.warning("Configure a chave API na barra lateral antes de usar.")
@@ -3475,18 +3731,40 @@ def render_evidencias_tab():
         "Afirmacao / Paragrafo a ser apoiado:",
         height=130,
         placeholder="Ex: O TDAH em adultos apresenta taxas de comorbidade com ansiedade superiores a 50%, com impacto significativo na funcionalidade...",
-        key="ev_claim"
+        key="ev_claim",
     )
 
     art_files = st.file_uploader(
-        "Artigos de referencia (PDF ou DOCX):",
-        type=["pdf","docx"],
+        "Artigos de referencia (PDF ou DOCX) — opcional:",
+        type=["pdf", "docx"],
         accept_multiple_files=True,
-        key="ev_articles"
+        key="ev_articles",
+        help="Deixe em branco para busca automatica nas bases PubMed, Europe PMC, OpenAlex e LILACS.",
     )
 
-    run_ev = st.button("Buscar evidencias", type="primary",
-                       disabled=not api_key or not claim.strip() or not art_files)
+    online_mode = not art_files  # True quando nenhum arquivo for anexado
+
+    if online_mode:
+        st.info(
+            "📡 **Modo busca automatica:** nenhum artigo anexado. "
+            "A IA vai gerar queries de busca a partir do seu paragrafo, "
+            "consultar PubMed, Europe PMC, OpenAlex e LILACS, "
+            "e avaliar quais artigos encontrados apoiam sua afirmacao.",
+            icon=None,
+        )
+    else:
+        st.success(
+            f"📂 **Modo analise local:** {len(art_files)} artigo(s) carregado(s). "
+            "A IA vai analisar os PDFs/DOCX que voce forneceu.",
+            icon=None,
+        )
+
+    run_ev = st.button(
+        "🔍 Buscar evidencias" if online_mode else "🔍 Analisar artigos anexados",
+        type="primary",
+        disabled=not api_key or not claim.strip(),
+        use_container_width=True,
+    )
 
     if run_ev:
         try:
@@ -3495,84 +3773,46 @@ def render_evidencias_tab():
             st.error(f"Erro ao inicializar cliente: {e}")
             return
 
-        results_ev = []
-        progress = st.progress(0)
-        for idx, af in enumerate(art_files, 1):
-            progress.progress(idx / len(art_files), text=f"Analisando {af.name}...")
-            b = af.read()
-            if af.name.lower().endswith(".pdf"):
-                art_text = extract_text_from_pdf(b)
-            else:
-                art_text = extract_text_from_docx(b)
-            ev_result = find_evidence_ai(client, provider, model, claim, art_text, af.name)
-            results_ev.append(ev_result)
-        progress.empty()
-        st.session_state["last_ev_results"] = results_ev
-        st.session_state["last_ev_claim"]   = claim
+        if online_mode:
+            # ── ONLINE MODE: search databases automatically ──────────────────
+            with st.spinner("Gerando queries de busca e consultando bases cientificas..."):
+                try:
+                    results_ev = _search_evidence_online(client, provider, model, claim)
+                    if not results_ev:
+                        st.warning(
+                            "Nenhum artigo com suporte relevante foi encontrado nas bases consultadas. "
+                            "Tente reformular a afirmacao com termos mais especificos, "
+                            "ou faca upload manual de artigos de referencia.")
+                        return
+                except Exception as e:
+                    import traceback as _tb
+                    st.error(f"Erro na busca online: {e}")
+                    with st.expander("Detalhes"):
+                        st.code(_tb.format_exc())
+                    return
+        else:
+            # ── LOCAL MODE: analyse uploaded files ───────────────────────────
+            results_ev = []
+            progress   = st.progress(0)
+            for idx, af in enumerate(art_files, 1):
+                progress.progress(idx / len(art_files), text=f"Analisando {af.name}...")
+                b = af.read()
+                art_text = (extract_text_from_pdf(b)
+                            if af.name.lower().endswith(".pdf")
+                            else extract_text_from_docx(b))
+                ev_result = find_evidence_ai(client, provider, model, claim, art_text, af.name)
+                results_ev.append(ev_result)
+            progress.empty()
 
-    ev_results = st.session_state.get("last_ev_results")
-    if not ev_results:
-        return
+        st.session_state["last_ev_results"]     = results_ev
+        st.session_state["last_ev_claim"]       = claim
+        st.session_state["last_ev_online_mode"] = online_mode
 
-    st.divider()
-    st.markdown("#### Evidencias Encontradas")
+    ev_results   = st.session_state.get("last_ev_results")
+    saved_online = st.session_state.get("last_ev_online_mode", False)
 
-    if st.session_state.get("last_ev_claim"):
-        st.info(f"**Afirmacao analisada:** {st.session_state['last_ev_claim'][:300]}")
-
-    for ev in ev_results:
-        if "error" in ev and "passages" not in ev:
-            st.error(f"Erro no artigo {ev.get('article','')}: {ev.get('error')}")
-            continue
-
-        support = ev.get("overall_support","N/A")
-        color_map = {"Forte":"🟢","Parcial":"🟡","Fraco":"🟠","Nenhum":"🔴"}
-        icon = color_map.get(support,"⚪")
-
-        with st.expander(f"{icon} **{ev.get('article','')}** — Suporte: {support}", expanded=True):
-            if ev.get("summary"):
-                st.markdown(f"*{ev['summary']}*")
-
-            passages = ev.get("passages",[])
-            if not passages:
-                st.warning("Nenhum trecho de suporte encontrado neste artigo.")
-                continue
-
-            for i, p in enumerate(passages, 1):
-                rel   = p.get("relevance","")
-                rel_c = "green" if rel == "Alta" else ("orange" if rel == "Media" else "red")
-                loc   = f" — {p['location']}" if p.get("location") else ""
-                st.markdown(
-                    f"**Trecho {i}** :{rel_c}[Relevancia {rel}]{loc}",
-                    unsafe_allow_html=False
-                )
-                st.markdown(
-                    f'<div class="ref-box">{p.get("text","")}</div>',
-                    unsafe_allow_html=True
-                )
-                if p.get("explanation"):
-                    st.caption(f"Por que apoia: {p['explanation']}")
-
-    # Download evidence report as text
-    if ev_results:
-        lines = ["BUSCA DE EVIDENCIAS", f"Afirmacao: {st.session_state.get('last_ev_claim','')}", ""]
-        for ev in ev_results:
-            lines.append("")
-            lines.append(f"ARTIGO: {ev.get('article','')}")
-            lines.append(f"Suporte geral: {ev.get('overall_support','')}")
-            lines.append(f"Resumo: {ev.get('summary','')}")
-            for i, p in enumerate(ev.get("passages",[]), 1):
-                lines.append("")
-                lines.append(f"  Trecho {i} [Relevancia {p.get('relevance','')}]:")
-                lines.append('  "' + p.get("text","") + '"')
-                lines.append(f"  -> {p.get('explanation','')}")
-        st.download_button(
-            "📥 Baixar relatorio de evidencias (.txt)",
-            data="\n".join(lines).encode("utf-8"),
-            file_name="evidencias.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+    if ev_results is not None:
+        _display_ev_results(ev_results, online_mode=saved_online)
 
 
 
@@ -4325,7 +4565,7 @@ def build_pptx_from_image_bg(template_img_bytes: bytes, content: dict,
         for i, b in enumerate(bullets[:8]):
             p = tf2.paragraphs[0] if i == 0 else tf2.add_paragraph()
             run = p.add_run()
-            run.text = f"\u2022  {b}"
+            run.text = f"\\u2022  {b}"
             run.font.size = Pt(16)
             run.font.color.rgb = RGBColor(40, 40, 40)
     buf = BytesIO()
@@ -4449,8 +4689,8 @@ def render_redesenhar_slide_tab():
             try:
                 if tmpl_lower.endswith(".pptx"):
                     tmpl_img_bytes = None  # no render available without LibreOffice
-                    tmpl_desc = "Professional corporate slide with blue and gold color scheme, " + \
-                                "icons and structured layout as provided in the PPTX template."
+                    tmpl_desc = ("Professional corporate slide with blue and gold color scheme, "
+                                 "icons and structured layout as provided in the PPTX template.")
                 else:
                     tmpl_mime = "image/png" if "png" in tmpl_lower else "image/jpeg"
                     tmpl_img_bytes = tmpl_bytes
@@ -4516,16 +4756,154 @@ def render_redesenhar_slide_tab():
             st.session_state["rd_image"] = None
             st.rerun()
 
+
+
+# =============================================================================
+# GUIA DO USUARIO — popup de ajuda
+# =============================================================================
+
+GUIA_CONTEUDO = {
+    "📖 Biblioteca": {
+        "desc": "Gerencie sua coleção de artigos científicos.",
+        "passos": [
+            "Adicione artigos via DOI, PubMed ID ou busca por palavras-chave.",
+            "Os artigos salvos ficam disponíveis automaticamente em todas as abas.",
+            "Use os filtros para encontrar artigos por título, autores ou ano.",
+            "Exporte sua biblioteca para CSV ou BibTeX.",
+        ],
+        "dica": "Mantenha a biblioteca atualizada — ela é a base de referências para o processamento de texto.",
+    },
+    "✍️ Processar Texto": {
+        "desc": "Insere ou revisa citações Vancouver em textos científicos usando IA.",
+        "passos": [
+            "Escolha o modo: 'Adicionar citações' (texto sem refs) ou 'Revisar citações' (texto já citado).",
+            "Faça upload do seu texto (PDF, Word ou .md) ou cole diretamente.",
+            "Opcionalmente, anexe PDFs dos artigos de referência (sem upload, a IA busca no PubMed automaticamente).",
+            "Clique em 'Processar texto com IA' e aguarde.",
+            "Revise os parágrafos modificados e baixe o Word formatado.",
+        ],
+        "dica": "Para textos longos (>5 páginas), o processamento é feito em partes — aguarde a barra de progresso concluir.",
+    },
+    "🔍 Revisão Completa": {
+        "desc": "Revisão acadêmica profunda: estrutura, argumentação, coerência e linguagem.",
+        "passos": [
+            "Faça upload do texto ou cole-o.",
+            "Clique em 'Revisar com IA'.",
+            "Veja o texto revisado lado a lado com o original.",
+            "Baixe o relatório de revisão em Word.",
+        ],
+        "dica": "Use esta aba para uma revisão editorial completa, não apenas de citações.",
+    },
+    "✅ Verificar Refs": {
+        "desc": "Verifica se as referências bibliográficas estão corretas e completas.",
+        "passos": [
+            "Cole sua lista de referências no campo indicado.",
+            "A IA confere cada referência contra PubMed e CrossRef.",
+            "Referências com erros são marcadas em vermelho com a correção sugerida.",
+            "Baixe o relatório com todas as correções.",
+        ],
+        "dica": "Ideal para uso antes da submissão: detecta DOIs errados, autores faltando e formatação incorreta.",
+    },
+    "🔄 Converter": {
+        "desc": "Converte listas de referências entre formatos (Vancouver ↔ APA ↔ ABNT ↔ Chicago).",
+        "passos": [
+            "Cole a lista de referências no formato de origem.",
+            "Selecione o formato de destino.",
+            "Clique em 'Converter' e baixe o resultado.",
+        ],
+        "dica": "Funciona com listas mistas — a IA detecta o formato automaticamente.",
+    },
+    "🔬 Buscar Evidências": {
+        "desc": "Encontra evidências científicas que apoiam um parágrafo ou afirmação.",
+        "passos": [
+            "Cole o parágrafo ou afirmação que precisa de embasamento.",
+            "Sem upload: a IA busca automaticamente em PubMed, Europe PMC, OpenAlex e LILACS.",
+            "Com upload: anexe PDFs de artigos e a IA encontra os trechos de suporte dentro deles.",
+            "Veja os trechos relevantes com nível de suporte (Forte/Parcial/Fraco).",
+            "Baixe o relatório de evidências em .txt.",
+        ],
+        "dica": "Modo sem upload é ideal para exploração inicial; modo com upload é para análise profunda de artigos específicos.",
+    },
+    "📊 Citar PPT": {
+        "desc": "Insere citações Vancouver nos slides de apresentações PowerPoint.",
+        "passos": [
+            "Faça upload do arquivo .pptx.",
+            "Opcionalmente, adicione PDFs dos artigos de referência.",
+            "Clique em 'Processar Apresentação'.",
+            "As citações são inseridas nas notas de cada slide.",
+            "Baixe o PPTX anotado e/ou o relatório Word.",
+        ],
+        "dica": "Use a opção 'Incluir rodapé nos slides' para que as citações apareçam visíveis na apresentação.",
+    },
+    "🎨 Redesenhar Slide": {
+        "desc": "Aplica o conteúdo de um slide rascunho ao layout de um template profissional.",
+        "passos": [
+            "Faça upload do slide rascunho (PPTX ou imagem).",
+            "Faça upload do template de destino (PPTX ou imagem).",
+            "A IA extrai o conteúdo do rascunho e aplica ao template.",
+            "Com chave OpenAI: gera versão visual via DALL-E 3.",
+            "Baixe o resultado em PPTX e/ou PNG.",
+        ],
+        "dica": "Funciona melhor com templates PPTX. Para imagens, o resultado é mais visual mas menos preciso na formatação.",
+    },
+}
+
+
+def render_user_guide():
+    """Render user guide as a modal-style expander at the top of the page."""
+    with st.sidebar:
+        st.divider()
+        with st.expander("📘 Guia do Usuário", expanded=False):
+            aba_names = list(GUIA_CONTEUDO.keys())
+            sel_aba = st.selectbox(
+                "Selecione a aba:",
+                aba_names,
+                key="guia_aba_sel",
+                label_visibility="collapsed",
+            )
+            info = GUIA_CONTEUDO[sel_aba]
+            st.markdown(f"**{sel_aba}**")
+            st.markdown(info["desc"])
+            st.markdown("**Como usar:**")
+            for i, passo in enumerate(info["passos"], 1):
+                st.markdown(f"{i}. {passo}")
+            st.info(f"💡 **Dica:** {info['dica']}")
+
+
+def render_user_guide_main():
+    """Render a dismissible tutorial banner on first use (top of page)."""
+    if st.session_state.get("guia_dismissed"):
+        return
+
+    with st.container():
+        col_msg, col_btn = st.columns([8, 2])
+        with col_msg:
+            st.info(
+                "👋 **Bem-vindo ao CitacaoIA!** Primeira vez aqui? "
+                "Veja o **Guia do Usuário** na barra lateral (📘) para entender cada aba. "
+                "Ou feche este aviso se já conhece o sistema.",
+                icon=None,
+            )
+        with col_btn:
+            if st.button("✕ Fechar", key="btn_dismiss_guia", use_container_width=True):
+                st.session_state["guia_dismissed"] = True
+                st.rerun()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
     # ── Authentication gate ────────────────────────────────────────────────
     if not render_login_page():
-        return  # Not logged in — show only login page
+        return
 
     auth_user = st.session_state.get("auth_user", "")
     auth_role = st.session_state.get("auth_role", "user")
 
     st.markdown("""<div class="cia-header">
-  <h1>CitacaoIA</h1>
+  <h1>📚 CitacaoIA</h1>
   <p>Gestor inteligente de citacoes . Vancouver . APA . ABNT . Chicago . Textos + Apresentacoes + Referencias . PubMed + EMBASE + LILACS + OpenAlex</p>
 </div>""", unsafe_allow_html=True)
 
@@ -4534,55 +4912,57 @@ def main():
     st.session_state["_provider"] = provider
     st.session_state["_model"]    = model
 
-    # Sidebar: user info + logout
+    # ── Sidebar: user guide + user info + logout ───────────────────────────
+    render_user_guide()
+
     with st.sidebar:
         st.divider()
-        st.caption(f"Logado como: **{auth_user}** ({auth_role})")
-        if st.button("Sair (logout)", key="btn_logout"):
+        st.caption(f"👤 **{auth_user}** ({auth_role})")
+        if st.button("🚪 Sair", key="btn_logout", use_container_width=True):
             _append_usage_log(auth_user, "logout")
             for k in ["auth_user", "auth_role"]:
                 if k in st.session_state:
                     del st.session_state[k]
             st.rerun()
 
-    for k in ["last_result","last_all_refs","last_final_refs","last_mode","last_revision",
-              "last_citation_style","last_vr_result","last_vr_style",
-              "last_md_conversion","last_md_conversion_name",
-              "last_ev_results","last_ev_claim",
-              "ppt_annotated","ppt_report_docx","ppt_slides_info",
-              "ppt_citations","ppt_all_refs","ppt_style","ppt_filename",
-              "rd_pptx","rd_image"]:
-        if k not in st.session_state:
-            st.session_state[k] = None
+    # ── Welcome banner (dismissible, first-time only) ─────────────────────
+    render_user_guide_main()
 
-    # Build tab list — Admin tab only for admin role
-    tab_labels = [
-        "\U0001f4d6 Biblioteca",
-        "\u270d\ufe0f Citar Texto",
-        "\U0001f4dd Revisao Editorial",
-        "\U0001f50d Verificar Referencias",
-        "\U0001f4c4 Converter Docs",
-        "\U0001f4a1 Buscar Evidencias",
-        "\U0001f4ca Referenciar PPT",
-        "\U0001f3a8 Redesenhar Slide",
-    ]
+    # ── Admin panel ────────────────────────────────────────────────────────
     if auth_role == "admin":
-        tab_labels.append("\u2699\ufe0f Configuracoes")
+        with st.expander("⚙️ Painel do Administrador", expanded=False):
+            render_admin_panel()
 
-    tabs = st.tabs(tab_labels)
+    # ── Main tabs ──────────────────────────────────────────────────────────
+    tab_bib, tab_citar, tab_rev, tab_vr, tab_conv, tab_ev, tab_ppt, tab_rd = st.tabs([
+        "📖 Biblioteca",
+        "✍️ Processar Texto",
+        "🔍 Revisao Completa",
+        "✅ Verificar Refs",
+        "🔄 Converter",
+        "🔬 Buscar Evidencias",
+        "📊 Citar PPT",
+        "🎨 Redesenhar Slide",
+    ])
 
-    with tabs[0]: render_biblioteca_tab()
-    with tabs[1]: render_citar_tab()
-    with tabs[2]: render_revisao_tab()
-    with tabs[3]: render_verificar_refs_tab()
-    with tabs[4]: render_converter_tab()
-    with tabs[5]: render_evidencias_tab()
-    with tabs[6]: render_citar_ppt_tab()
-    with tabs[7]: render_redesenhar_slide_tab()
-    if auth_role == "admin":
-        with tabs[8]: render_admin_panel()
+    with tab_bib:
+        render_biblioteca_tab()
+    with tab_citar:
+        render_citar_tab()
+    with tab_rev:
+        render_revisao_tab()
+    with tab_vr:
+        render_verificar_refs_tab()
+    with tab_conv:
+        render_converter_tab()
+    with tab_ev:
+        render_evidencias_tab()
+    with tab_ppt:
+        render_citar_ppt_tab()
+    with tab_rd:
+        render_redesenhar_slide_tab()
 
-    # Log active tab (lightweight — fires on every rerun, deduped by session)
+    # Log session activity (once per session)
     if st.session_state.get("_last_log_user") != auth_user:
         _append_usage_log(auth_user, "session_active", provider)
         st.session_state["_last_log_user"] = auth_user
