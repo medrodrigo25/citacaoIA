@@ -75,6 +75,280 @@ def _supa_available() -> bool:
     url, _ = _supa_cfg()
     return url is not None
 
+
+# =============================================================================
+# AUTENTICACAO — Login / Registro / Admin / Log de uso
+# =============================================================================
+import hashlib as _hashlib
+import uuid    as _uuid
+
+# ── Supabase tables required:
+#   users(id uuid pk, username text unique, password_hash text, role text,
+#         created_at timestamptz, invite_code text)
+#   invite_codes(code text pk, created_at timestamptz, used_by text, used_at timestamptz,
+#                max_uses int, uses int, expires_at timestamptz)
+#   usage_logs(id uuid pk, username text, feature text, detail text, ts timestamptz)
+# ── Fallback: JSON files in outputs dir (for local use / no Supabase)
+
+import os as _os, json as _json_auth
+_AUTH_FILE  = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "auth_db.json")
+_USAGE_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "usage_log.json")
+_ADMIN_USER = "admin"          # hardcoded initial admin username
+
+
+def _hash_pw(pw: str) -> str:
+    return _hashlib.sha256(pw.encode()).hexdigest()
+
+
+def _load_auth_db() -> dict:
+    if _os.path.exists(_AUTH_FILE):
+        with open(_AUTH_FILE, "r") as f:
+            return _json_auth.load(f)
+    # Default: create admin with temp password "admin123" and one invite code
+    db = {
+        "users": {
+            _ADMIN_USER: {
+                "password_hash": _hash_pw("admin123"),
+                "role": "admin",
+                "created_at": "",
+                "invite_code_used": "SYSTEM"
+            }
+        },
+        "invite_codes": {},
+        "settings": {}
+    }
+    _save_auth_db(db)
+    return db
+
+
+def _save_auth_db(db: dict):
+    with open(_AUTH_FILE, "w") as f:
+        _json_auth.dump(db, f, indent=2)
+
+
+def _load_usage_log() -> list:
+    if _os.path.exists(_USAGE_FILE):
+        with open(_USAGE_FILE, "r") as f:
+            return _json_auth.load(f)
+    return []
+
+
+def _append_usage_log(username: str, feature: str, detail: str = ""):
+    log = _load_usage_log()
+    log.append({
+        "username": username,
+        "feature":  feature,
+        "detail":   detail,
+        "ts":       __import__("datetime").datetime.now().isoformat()
+    })
+    with open(_USAGE_FILE, "w") as f:
+        _json_auth.dump(log[-2000:], f, indent=2)   # keep last 2000 entries
+
+
+def _gen_invite_code(db: dict, created_by: str, max_uses: int = 1,
+                     expires_days: int = 7) -> str:
+    from datetime import datetime, timedelta
+    code = str(_uuid.uuid4())[:8].upper()
+    db["invite_codes"][code] = {
+        "created_by":  created_by,
+        "created_at":  datetime.now().isoformat(),
+        "max_uses":    max_uses,
+        "uses":        0,
+        "expires_at":  (datetime.now() + timedelta(days=expires_days)).isoformat(),
+        "used_by":     []
+    }
+    _save_auth_db(db)
+    return code
+
+
+def _validate_invite(db: dict, code: str) -> tuple:
+    """Returns (ok: bool, message: str)"""
+    from datetime import datetime
+    if code not in db["invite_codes"]:
+        return False, "Codigo de convite invalido."
+    inv = db["invite_codes"][code]
+    if inv["uses"] >= inv["max_uses"]:
+        return False, "Codigo ja foi utilizado o numero maximo de vezes."
+    if datetime.fromisoformat(inv["expires_at"]) < datetime.now():
+        return False, "Codigo de convite expirado."
+    return True, "OK"
+
+
+def _register_user(db: dict, username: str, password: str, invite_code: str) -> tuple:
+    username = username.strip().lower()
+    if not username or len(username) < 3:
+        return False, "Nome de usuario deve ter ao menos 3 caracteres."
+    if not password or len(password) < 6:
+        return False, "Senha deve ter ao menos 6 caracteres."
+    if username in db["users"]:
+        return False, "Nome de usuario ja existe."
+    ok, msg = _validate_invite(db, invite_code)
+    if not ok:
+        return False, msg
+    db["users"][username] = {
+        "password_hash":  _hash_pw(password),
+        "role":           "user",
+        "created_at":     __import__("datetime").datetime.now().isoformat(),
+        "invite_code_used": invite_code
+    }
+    db["invite_codes"][invite_code]["uses"] += 1
+    db["invite_codes"][invite_code]["used_by"].append(username)
+    _save_auth_db(db)
+    return True, "Conta criada com sucesso!"
+
+
+def _authenticate(db: dict, username: str, password: str) -> tuple:
+    username = username.strip().lower()
+    user = db["users"].get(username)
+    if not user:
+        return False, "Usuario nao encontrado."
+    if user["password_hash"] != _hash_pw(password):
+        return False, "Senha incorreta."
+    return True, user["role"]
+
+
+# ── Supabase wrappers (use local fallback if Supabase not configured) ──────
+
+def auth_check_supabase() -> bool:
+    """Returns True if Supabase is available for auth."""
+    sb = _get_supabase()
+    return sb is not None
+
+
+def render_login_page() -> bool:
+    """Show login/register UI. Returns True if user is authenticated."""
+    # Already logged in?
+    if st.session_state.get("auth_user"):
+        return True
+
+    st.markdown("""
+    <div style="max-width:420px;margin:80px auto 0 auto;padding:2rem;
+    border-radius:16px;box-shadow:0 4px 24px #0001;background:#fff;">
+    <h2 style="color:#003366;text-align:center;margin-bottom:0.2rem">CitacaoIA</h2>
+    <p style="color:#888;text-align:center;font-size:0.9rem;margin-bottom:1.5rem">
+    Gestor Inteligente de Citacoes</p>
+    """, unsafe_allow_html=True)
+
+    tab_login, tab_reg = st.tabs(["Entrar", "Criar conta (convite)"])
+
+    db = _load_auth_db()
+
+    with tab_login:
+        u = st.text_input("Usuario", key="login_u", placeholder="seu.usuario")
+        p = st.text_input("Senha",   key="login_p", type="password")
+        if st.button("Entrar", type="primary", use_container_width=True, key="btn_login"):
+            ok, role_or_msg = _authenticate(db, u, p)
+            if ok:
+                st.session_state["auth_user"] = u.strip().lower()
+                st.session_state["auth_role"] = role_or_msg
+                _append_usage_log(u.strip().lower(), "login")
+                st.rerun()
+            else:
+                st.error(role_or_msg)
+
+    with tab_reg:
+        st.caption("Voce recebeu um codigo de convite? Crie sua conta aqui.")
+        inv  = st.text_input("Codigo de convite", key="reg_inv",
+                              placeholder="XXXXXXXX").strip().upper()
+        nu   = st.text_input("Escolha um usuario", key="reg_u",
+                              placeholder="min. 3 caracteres")
+        np   = st.text_input("Crie uma senha",  key="reg_p",
+                              type="password", placeholder="min. 6 caracteres")
+        np2  = st.text_input("Confirme a senha", key="reg_p2", type="password")
+        if st.button("Criar conta", type="primary", use_container_width=True, key="btn_reg"):
+            if np != np2:
+                st.error("As senhas nao coincidem.")
+            else:
+                ok, msg = _register_user(db, nu, np, inv)
+                if ok:
+                    st.success(msg)
+                    st.info("Agora faca login na aba 'Entrar'.")
+                else:
+                    st.error(msg)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    return False
+
+
+def render_admin_panel():
+    """Admin-only settings panel: user management, invite codes, usage logs."""
+    st.markdown("---")
+    with st.expander("Painel do Administrador", expanded=False):
+        db  = _load_auth_db()
+        log = _load_usage_log()
+
+        admin_tab1, admin_tab2, admin_tab3 = st.tabs(
+            ["Usuarios", "Codigos de Convite", "Log de Uso"]
+        )
+
+        with admin_tab1:
+            st.markdown("**Usuarios cadastrados**")
+            users_data = [
+                {"Usuario": u, "Papel": d["role"],
+                 "Criado em": d.get("created_at","")[:10],
+                 "Convite usado": d.get("invite_code_used","")}
+                for u, d in db["users"].items()
+            ]
+            if users_data:
+                import pandas as _pd
+                st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
+            else:
+                st.info("Nenhum usuario cadastrado.")
+
+            st.markdown("**Remover usuario**")
+            user_to_del = st.selectbox(
+                "Selecione o usuario para remover:",
+                [u for u in db["users"] if u != _ADMIN_USER],
+                key="del_user_sel"
+            )
+            if st.button("Remover usuario selecionado", key="btn_del_user"):
+                if user_to_del and user_to_del in db["users"]:
+                    del db["users"][user_to_del]
+                    _save_auth_db(db)
+                    st.success(f"Usuario '{user_to_del}' removido.")
+                    st.rerun()
+
+        with admin_tab2:
+            st.markdown("**Gerar novo codigo de convite**")
+            col_i1, col_i2 = st.columns(2)
+            max_uses_inv = col_i1.number_input("Usos maximos", min_value=1, max_value=50, value=1, key="inv_max")
+            expires_inv  = col_i2.number_input("Validade (dias)", min_value=1, max_value=90, value=7, key="inv_exp")
+            if st.button("Gerar codigo", type="primary", key="btn_gen_inv"):
+                code = _gen_invite_code(db, st.session_state["auth_user"],
+                                         int(max_uses_inv), int(expires_inv))
+                st.success(f"Codigo gerado: **`{code}`**")
+                st.info(f"Compartilhe este codigo com o usuario. Valido por {expires_inv} dias, maximo {max_uses_inv} uso(s).")
+
+            st.markdown("**Codigos existentes**")
+            inv_data = [
+                {"Codigo": c, "Criado por": d["created_by"],
+                 "Usos": f"{d['uses']}/{d['max_uses']}",
+                 "Expira": d.get("expires_at","")[:10],
+                 "Usado por": ", ".join(d.get("used_by",[]))}
+                for c, d in db["invite_codes"].items()
+            ]
+            if inv_data:
+                import pandas as _pd2
+                st.dataframe(_pd2.DataFrame(inv_data), use_container_width=True)
+
+        with admin_tab3:
+            st.markdown("**Log de uso (ultimas 200 acoes)**")
+            if log:
+                import pandas as _pd3
+                df_log = _pd3.DataFrame(log[-200:][::-1])
+                df_log.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
+                # Filter by user
+                users_in_log = ["Todos"] + sorted(df_log["Usuario"].unique().tolist())
+                filt_u = st.selectbox("Filtrar por usuario:", users_in_log, key="log_filt")
+                if filt_u != "Todos":
+                    df_log = df_log[df_log["Usuario"] == filt_u]
+                st.dataframe(df_log, use_container_width=True)
+                csv_bytes = df_log.to_csv(index=False).encode()
+                st.download_button("Exportar CSV", data=csv_bytes,
+                                   file_name="usage_log.csv", mime="text/csv")
+            else:
+                st.info("Nenhuma acao registrada ainda.")
+
 # =============================================================================
 # BIBLIOTECA  (Supabase quando disponivel, JSON local como fallback)
 # =============================================================================
@@ -1514,6 +1788,280 @@ def render_sidebar():
         if lib:
             st.caption(f"Arquivo: {BIBLIOTECA_FILE}")
     return api_key, provider, model
+
+
+# =============================================================================
+# AUTENTICACAO — Login / Registro / Admin / Log de uso
+# =============================================================================
+import hashlib as _hashlib
+import uuid    as _uuid
+
+# ── Supabase tables required:
+#   users(id uuid pk, username text unique, password_hash text, role text,
+#         created_at timestamptz, invite_code text)
+#   invite_codes(code text pk, created_at timestamptz, used_by text, used_at timestamptz,
+#                max_uses int, uses int, expires_at timestamptz)
+#   usage_logs(id uuid pk, username text, feature text, detail text, ts timestamptz)
+# ── Fallback: JSON files in outputs dir (for local use / no Supabase)
+
+import os as _os, json as _json_auth
+_AUTH_FILE  = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "auth_db.json")
+_USAGE_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "usage_log.json")
+_ADMIN_USER = "admin"          # hardcoded initial admin username
+
+
+def _hash_pw(pw: str) -> str:
+    return _hashlib.sha256(pw.encode()).hexdigest()
+
+
+def _load_auth_db() -> dict:
+    if _os.path.exists(_AUTH_FILE):
+        with open(_AUTH_FILE, "r") as f:
+            return _json_auth.load(f)
+    # Default: create admin with temp password "admin123" and one invite code
+    db = {
+        "users": {
+            _ADMIN_USER: {
+                "password_hash": _hash_pw("admin123"),
+                "role": "admin",
+                "created_at": "",
+                "invite_code_used": "SYSTEM"
+            }
+        },
+        "invite_codes": {},
+        "settings": {}
+    }
+    _save_auth_db(db)
+    return db
+
+
+def _save_auth_db(db: dict):
+    with open(_AUTH_FILE, "w") as f:
+        _json_auth.dump(db, f, indent=2)
+
+
+def _load_usage_log() -> list:
+    if _os.path.exists(_USAGE_FILE):
+        with open(_USAGE_FILE, "r") as f:
+            return _json_auth.load(f)
+    return []
+
+
+def _append_usage_log(username: str, feature: str, detail: str = ""):
+    log = _load_usage_log()
+    log.append({
+        "username": username,
+        "feature":  feature,
+        "detail":   detail,
+        "ts":       __import__("datetime").datetime.now().isoformat()
+    })
+    with open(_USAGE_FILE, "w") as f:
+        _json_auth.dump(log[-2000:], f, indent=2)   # keep last 2000 entries
+
+
+def _gen_invite_code(db: dict, created_by: str, max_uses: int = 1,
+                     expires_days: int = 7) -> str:
+    from datetime import datetime, timedelta
+    code = str(_uuid.uuid4())[:8].upper()
+    db["invite_codes"][code] = {
+        "created_by":  created_by,
+        "created_at":  datetime.now().isoformat(),
+        "max_uses":    max_uses,
+        "uses":        0,
+        "expires_at":  (datetime.now() + timedelta(days=expires_days)).isoformat(),
+        "used_by":     []
+    }
+    _save_auth_db(db)
+    return code
+
+
+def _validate_invite(db: dict, code: str) -> tuple:
+    """Returns (ok: bool, message: str)"""
+    from datetime import datetime
+    if code not in db["invite_codes"]:
+        return False, "Codigo de convite invalido."
+    inv = db["invite_codes"][code]
+    if inv["uses"] >= inv["max_uses"]:
+        return False, "Codigo ja foi utilizado o numero maximo de vezes."
+    if datetime.fromisoformat(inv["expires_at"]) < datetime.now():
+        return False, "Codigo de convite expirado."
+    return True, "OK"
+
+
+def _register_user(db: dict, username: str, password: str, invite_code: str) -> tuple:
+    username = username.strip().lower()
+    if not username or len(username) < 3:
+        return False, "Nome de usuario deve ter ao menos 3 caracteres."
+    if not password or len(password) < 6:
+        return False, "Senha deve ter ao menos 6 caracteres."
+    if username in db["users"]:
+        return False, "Nome de usuario ja existe."
+    ok, msg = _validate_invite(db, invite_code)
+    if not ok:
+        return False, msg
+    db["users"][username] = {
+        "password_hash":  _hash_pw(password),
+        "role":           "user",
+        "created_at":     __import__("datetime").datetime.now().isoformat(),
+        "invite_code_used": invite_code
+    }
+    db["invite_codes"][invite_code]["uses"] += 1
+    db["invite_codes"][invite_code]["used_by"].append(username)
+    _save_auth_db(db)
+    return True, "Conta criada com sucesso!"
+
+
+def _authenticate(db: dict, username: str, password: str) -> tuple:
+    username = username.strip().lower()
+    user = db["users"].get(username)
+    if not user:
+        return False, "Usuario nao encontrado."
+    if user["password_hash"] != _hash_pw(password):
+        return False, "Senha incorreta."
+    return True, user["role"]
+
+
+# ── Supabase wrappers (use local fallback if Supabase not configured) ──────
+
+def auth_check_supabase() -> bool:
+    """Returns True if Supabase is available for auth."""
+    sb = _get_supabase()
+    return sb is not None
+
+
+def render_login_page() -> bool:
+    """Show login/register UI. Returns True if user is authenticated."""
+    # Already logged in?
+    if st.session_state.get("auth_user"):
+        return True
+
+    st.markdown("""
+    <div style="max-width:420px;margin:80px auto 0 auto;padding:2rem;
+    border-radius:16px;box-shadow:0 4px 24px #0001;background:#fff;">
+    <h2 style="color:#003366;text-align:center;margin-bottom:0.2rem">CitacaoIA</h2>
+    <p style="color:#888;text-align:center;font-size:0.9rem;margin-bottom:1.5rem">
+    Gestor Inteligente de Citacoes</p>
+    """, unsafe_allow_html=True)
+
+    tab_login, tab_reg = st.tabs(["Entrar", "Criar conta (convite)"])
+
+    db = _load_auth_db()
+
+    with tab_login:
+        u = st.text_input("Usuario", key="login_u", placeholder="seu.usuario")
+        p = st.text_input("Senha",   key="login_p", type="password")
+        if st.button("Entrar", type="primary", use_container_width=True, key="btn_login"):
+            ok, role_or_msg = _authenticate(db, u, p)
+            if ok:
+                st.session_state["auth_user"] = u.strip().lower()
+                st.session_state["auth_role"] = role_or_msg
+                _append_usage_log(u.strip().lower(), "login")
+                st.rerun()
+            else:
+                st.error(role_or_msg)
+
+    with tab_reg:
+        st.caption("Voce recebeu um codigo de convite? Crie sua conta aqui.")
+        inv  = st.text_input("Codigo de convite", key="reg_inv",
+                              placeholder="XXXXXXXX").strip().upper()
+        nu   = st.text_input("Escolha um usuario", key="reg_u",
+                              placeholder="min. 3 caracteres")
+        np   = st.text_input("Crie uma senha",  key="reg_p",
+                              type="password", placeholder="min. 6 caracteres")
+        np2  = st.text_input("Confirme a senha", key="reg_p2", type="password")
+        if st.button("Criar conta", type="primary", use_container_width=True, key="btn_reg"):
+            if np != np2:
+                st.error("As senhas nao coincidem.")
+            else:
+                ok, msg = _register_user(db, nu, np, inv)
+                if ok:
+                    st.success(msg)
+                    st.info("Agora faca login na aba 'Entrar'.")
+                else:
+                    st.error(msg)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    return False
+
+
+def render_admin_panel():
+    """Admin-only settings panel: user management, invite codes, usage logs."""
+    st.markdown("---")
+    with st.expander("Painel do Administrador", expanded=False):
+        db  = _load_auth_db()
+        log = _load_usage_log()
+
+        admin_tab1, admin_tab2, admin_tab3 = st.tabs(
+            ["Usuarios", "Codigos de Convite", "Log de Uso"]
+        )
+
+        with admin_tab1:
+            st.markdown("**Usuarios cadastrados**")
+            users_data = [
+                {"Usuario": u, "Papel": d["role"],
+                 "Criado em": d.get("created_at","")[:10],
+                 "Convite usado": d.get("invite_code_used","")}
+                for u, d in db["users"].items()
+            ]
+            if users_data:
+                import pandas as _pd
+                st.dataframe(_pd.DataFrame(users_data), use_container_width=True)
+            else:
+                st.info("Nenhum usuario cadastrado.")
+
+            st.markdown("**Remover usuario**")
+            user_to_del = st.selectbox(
+                "Selecione o usuario para remover:",
+                [u for u in db["users"] if u != _ADMIN_USER],
+                key="del_user_sel"
+            )
+            if st.button("Remover usuario selecionado", key="btn_del_user"):
+                if user_to_del and user_to_del in db["users"]:
+                    del db["users"][user_to_del]
+                    _save_auth_db(db)
+                    st.success(f"Usuario '{user_to_del}' removido.")
+                    st.rerun()
+
+        with admin_tab2:
+            st.markdown("**Gerar novo codigo de convite**")
+            col_i1, col_i2 = st.columns(2)
+            max_uses_inv = col_i1.number_input("Usos maximos", min_value=1, max_value=50, value=1, key="inv_max")
+            expires_inv  = col_i2.number_input("Validade (dias)", min_value=1, max_value=90, value=7, key="inv_exp")
+            if st.button("Gerar codigo", type="primary", key="btn_gen_inv"):
+                code = _gen_invite_code(db, st.session_state["auth_user"],
+                                         int(max_uses_inv), int(expires_inv))
+                st.success(f"Codigo gerado: **`{code}`**")
+                st.info(f"Compartilhe este codigo com o usuario. Valido por {expires_inv} dias, maximo {max_uses_inv} uso(s).")
+
+            st.markdown("**Codigos existentes**")
+            inv_data = [
+                {"Codigo": c, "Criado por": d["created_by"],
+                 "Usos": f"{d['uses']}/{d['max_uses']}",
+                 "Expira": d.get("expires_at","")[:10],
+                 "Usado por": ", ".join(d.get("used_by",[]))}
+                for c, d in db["invite_codes"].items()
+            ]
+            if inv_data:
+                import pandas as _pd2
+                st.dataframe(_pd2.DataFrame(inv_data), use_container_width=True)
+
+        with admin_tab3:
+            st.markdown("**Log de uso (ultimas 200 acoes)**")
+            if log:
+                import pandas as _pd3
+                df_log = _pd3.DataFrame(log[-200:][::-1])
+                df_log.columns = ["Usuario", "Funcao", "Detalhe", "Data/Hora"]
+                # Filter by user
+                users_in_log = ["Todos"] + sorted(df_log["Usuario"].unique().tolist())
+                filt_u = st.selectbox("Filtrar por usuario:", users_in_log, key="log_filt")
+                if filt_u != "Todos":
+                    df_log = df_log[df_log["Usuario"] == filt_u]
+                st.dataframe(df_log, use_container_width=True)
+                csv_bytes = df_log.to_csv(index=False).encode()
+                st.download_button("Exportar CSV", data=csv_bytes,
+                                   file_name="usage_log.csv", mime="text/csv")
+            else:
+                st.info("Nenhuma acao registrada ainda.")
 
 # =============================================================================
 # BIBLIOTECA TAB
@@ -3578,7 +4126,414 @@ REFERENCE LIST:
 # MAIN
 # =============================================================================
 
+
+# =============================================================================
+# REDESENHAR SLIDE — Vision AI + DALL-E 3 + python-pptx
+# =============================================================================
+
+def ai_vision_call(client, provider: str, model: str,
+                   image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    """Call vision-capable AI to analyze an image. Returns raw text."""
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    try:
+        if provider == "Anthropic (Claude)":
+            vision_model = "claude-3-5-sonnet-20241022"
+            resp = client.messages.create(
+                model=vision_model,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": [
+                    {"type": "image",
+                     "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+                    {"type": "text", "text": prompt}
+                ]}]
+            )
+            return resp.content[0].text
+        elif provider == "OpenAI":
+            from openai import OpenAI as _OAI
+            oc = _OAI(api_key=client.api_key) if hasattr(client, "api_key") else client
+            resp = oc.chat.completions.create(
+                model="gpt-4o", max_tokens=2000,
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+                    {"type": "text", "text": prompt}
+                ]}]
+            )
+            return resp.choices[0].message.content
+        else:  # Gemini
+            import google.genai.types as _gt
+            resp = client.models.generate_content(
+                model=model,
+                contents=[_gt.Part.from_bytes(data=image_bytes, mime_type=mime_type), prompt]
+            )
+            return resp.text
+    except Exception as e:
+        return f"Erro vision: {e}"
+
+
+def extract_slide_content_vision(client, provider: str, model: str,
+                                  image_bytes: bytes,
+                                  mime_type: str = "image/png") -> dict:
+    """Extract structured slide content using vision AI."""
+    prompt = (
+        "Analyze this presentation slide and extract ALL content as JSON. "
+        "Return ONLY valid JSON with no markdown:\n"
+        '{"title":"","subtitle":"","main_body":"","bullets":[],'
+        '"labels":[],"callouts":[],"diagram_description":"",'
+        '"layout_description":"","key_messages":[]}'
+    )
+    raw = ai_vision_call(client, provider, model, image_bytes, mime_type, prompt)
+    return extract_json_from_ai(raw) or {"title": "", "raw": raw}
+
+
+def extract_slide_content_pptx(pptx_bytes: bytes, slide_idx: int = 0) -> dict:
+    """Extract slide content from PPTX using python-pptx (no image conversion)."""
+    from pptx import Presentation as _Prs
+    prs = _Prs(BytesIO(pptx_bytes))
+    idx = min(slide_idx, len(prs.slides) - 1)
+    slide = prs.slides[idx]
+    content = {"title": "", "bullets": [], "labels": [], "callouts": [], "main_body": ""}
+    extra = []
+    for shape in slide.shapes:
+        if not hasattr(shape, "text") or not shape.text.strip():
+            continue
+        text = shape.text.strip()
+        is_title = False
+        if hasattr(shape, "placeholder_format") and shape.placeholder_format:
+            if shape.placeholder_format.idx in (0, 1):
+                is_title = True
+        if not is_title and "title" in shape.name.lower():
+            is_title = True
+        if is_title:
+            content["title"] = text
+        elif hasattr(shape, "text_frame"):
+            paras = [p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip()]
+            if len(paras) > 1:
+                content["bullets"].extend(paras)
+            elif paras:
+                extra.append(paras[0])
+    if extra:
+        content["main_body"] = "\n".join(extra)
+    return content
+
+
+def generate_slide_image_dalle(openai_api_key: str, content: dict,
+                                template_desc: str) -> bytes:
+    """Generate redesigned slide image using DALL-E 3."""
+    from openai import OpenAI as _OAI
+    oc = _OAI(api_key=openai_api_key)
+    title   = content.get("title", "")
+    bullets = content.get("bullets", [])
+    labels  = content.get("labels", [])
+    diagram = content.get("diagram_description", "")
+    c_desc  = f'Title: "{title}"'
+    if content.get("subtitle"):
+        c_desc += f'. Subtitle: "{content["subtitle"]}"'
+    if bullets:
+        c_desc += ". Bullets: " + " | ".join(f'"{b}"' for b in bullets[:6])
+    if labels:
+        c_desc += ". Labels: " + ", ".join(f'"{l}"' for l in labels[:4])
+    if diagram:
+        c_desc += f". Diagram/visual: {diagram}"
+    prompt = (
+        f"Professional medical/pharmaceutical presentation slide, widescreen 16:9. "
+        f"LAYOUT STYLE TO REPRODUCE: {template_desc[:500]}. "
+        f"EXACT CONTENT: {c_desc}. "
+        f"Corporate palette: dark navy blue and gold/amber. Clean white background. "
+        f"Professional icons. No extra text beyond specified content."
+    )
+    resp = oc.images.generate(
+        model="dall-e-3", prompt=prompt[:4000],
+        size="1792x1024", quality="hd", n=1,
+    )
+    r = requests.get(resp.data[0].url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+
+def fill_pptx_template_with_content(template_bytes: bytes, content: dict) -> bytes:
+    """Fill first slide of a PPTX template with extracted content."""
+    from pptx import Presentation as _Prs
+    from pptx.util import Pt
+    prs   = _Prs(BytesIO(template_bytes))
+    slide = prs.slides[0]
+    body_queue = []
+    if content.get("subtitle"):
+        body_queue.append(content["subtitle"])
+    if content.get("main_body"):
+        body_queue.append(content["main_body"])
+    body_queue.extend(content.get("bullets", []))
+    title_done = False
+    for shape in slide.shapes:
+        if not hasattr(shape, "text_frame"):
+            continue
+        is_title = False
+        if hasattr(shape, "placeholder_format") and shape.placeholder_format:
+            if shape.placeholder_format.idx in (0, 1):
+                is_title = True
+        if not is_title and "title" in shape.name.lower():
+            is_title = True
+        tf = shape.text_frame
+        if is_title and not title_done and content.get("title"):
+            for para in tf.paragraphs:
+                for run in para.runs:
+                    run.text = ""
+            if tf.paragraphs:
+                if tf.paragraphs[0].runs:
+                    tf.paragraphs[0].runs[0].text = content["title"]
+                else:
+                    tf.paragraphs[0].text = content["title"]
+            title_done = True
+        elif not is_title and body_queue:
+            new_text = body_queue.pop(0)
+            for para in tf.paragraphs:
+                for run in para.runs:
+                    run.text = ""
+            if tf.paragraphs:
+                if tf.paragraphs[0].runs:
+                    tf.paragraphs[0].runs[0].text = new_text
+                else:
+                    tf.paragraphs[0].text = new_text
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def build_pptx_from_image_bg(template_img_bytes: bytes, content: dict,
+                               template_name: str = "") -> bytes:
+    """Create PPTX with template image as background + text overlays."""
+    from pptx import Presentation as _Prs
+    from pptx.util import Inches, Pt, Emu
+    from pptx.dml.color import RGBColor
+    prs = _Prs()
+    prs.slide_width  = Emu(9144000)
+    prs.slide_height = Emu(5143500)
+    new_slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
+    img_stream = BytesIO(template_img_bytes)
+    new_slide.shapes.add_picture(
+        img_stream, Emu(0), Emu(0),
+        width=prs.slide_width, height=prs.slide_height
+    )
+    if content.get("title"):
+        tb = new_slide.shapes.add_textbox(Inches(0.4), Inches(0.2), Inches(8), Inches(1))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        run = p.add_run()
+        run.text = content["title"]
+        run.font.size  = Pt(28)
+        run.font.bold  = True
+        run.font.color.rgb = RGBColor(0, 51, 102)
+    bullets = content.get("bullets", [])
+    if content.get("main_body"):
+        bullets = [content["main_body"]] + bullets
+    if bullets:
+        tb2 = new_slide.shapes.add_textbox(Inches(0.6), Inches(1.4), Inches(7.5), Inches(4))
+        tf2 = tb2.text_frame
+        tf2.word_wrap = True
+        for i, b in enumerate(bullets[:8]):
+            p = tf2.paragraphs[0] if i == 0 else tf2.add_paragraph()
+            run = p.add_run()
+            run.text = f"\u2022  {b}"
+            run.font.size = Pt(16)
+            run.font.color.rgb = RGBColor(40, 40, 40)
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def render_redesenhar_slide_tab():
+    api_key  = st.session_state.get("_api_key", "")
+    provider = st.session_state.get("_provider", "Anthropic (Claude)")
+    model    = st.session_state.get("_model", "")
+
+    st.markdown("### Redesenhar Slide")
+    st.caption(
+        "Envie um slide rascunho (PPT ou imagem) e um layout template. "
+        "A IA extrai o conteudo do rascunho e aplica ao template, "
+        "gerando o resultado em PPTX e imagem PNG."
+    )
+
+    col_draft, col_tmpl = st.columns(2)
+    with col_draft:
+        st.markdown("#### Slide Rascunho")
+        draft_file = st.file_uploader(
+            "Upload rascunho (PPTX ou imagem)",
+            type=["pptx", "png", "jpg", "jpeg"],
+            key="rd_draft_upload",
+        )
+        if draft_file:
+            if draft_file.name.lower().endswith((".png", ".jpg", ".jpeg")):
+                st.image(draft_file, use_column_width=True)
+            else:
+                st.success(f"PPTX: {draft_file.name}")
+
+    with col_tmpl:
+        st.markdown("#### Layout Template")
+        tmpl_file = st.file_uploader(
+            "Upload template (PPTX ou imagem)",
+            type=["pptx", "png", "jpg", "jpeg"],
+            key="rd_tmpl_upload",
+        )
+        if tmpl_file:
+            if tmpl_file.name.lower().endswith((".png", ".jpg", ".jpeg")):
+                st.image(tmpl_file, use_column_width=True)
+            else:
+                st.success(f"Template PPTX: {tmpl_file.name}")
+
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        slide_num = st.number_input("Slide do rascunho (1 = primeiro)",
+                                    min_value=1, max_value=30, value=1)
+    with col_opt2:
+        use_dalle = st.checkbox(
+            "Gerar imagem com DALL-E 3 (OpenAI)",
+            value=(provider == "OpenAI"),
+            help="Requer chave OpenAI. Gera imagem do slide redesenhado.",
+        )
+
+    dalle_key = api_key
+    if use_dalle and provider != "OpenAI":
+        dalle_key = st.text_input("Chave OpenAI para DALL-E:",
+                                   type="password", key="rd_dalle_key")
+
+    st.divider()
+    run_rd = st.button("Redesenhar Slide", type="primary",
+                        use_container_width=True,
+                        disabled=(not draft_file or not tmpl_file or not api_key))
+
+    if run_rd:
+        draft_bytes = draft_file.read()
+        tmpl_bytes  = tmpl_file.read()
+        draft_lower = draft_file.name.lower()
+        tmpl_lower  = tmpl_file.name.lower()
+        slide_idx   = int(slide_num) - 1
+
+        try:
+            client = get_ai_client(provider, api_key)
+        except Exception as e:
+            st.error(f"Erro ao inicializar IA: {e}"); return
+
+        # 1. Extract content from draft
+        with st.spinner("Extraindo conteudo do rascunho com IA..."):
+            try:
+                if draft_lower.endswith(".pptx"):
+                    content = extract_slide_content_pptx(draft_bytes, slide_idx)
+                    # Try vision too for richer extraction
+                    try:
+                        from pptx import Presentation as _Prs2
+                        from PIL import Image as _PILImg
+                        # Quick PIL thumbnail from pptx text as placeholder
+                        # (LibreOffice not available on Cloud — use text-only extraction)
+                    except Exception:
+                        pass
+                else:
+                    mime = "image/png" if "png" in draft_lower else "image/jpeg"
+                    content = extract_slide_content_vision(
+                        client, provider, model, draft_bytes, mime)
+            except Exception as e:
+                st.error(f"Erro na extracao: {e}"); return
+
+        # Show extracted content as editable fields
+        st.markdown("#### Conteudo extraido (editavel antes de gerar)")
+        c1, c2 = st.columns(2)
+        with c1:
+            t_edit  = st.text_input("Titulo:", value=content.get("title", ""),  key="rd_t")
+            s_edit  = st.text_input("Subtitulo:", value=content.get("subtitle",""), key="rd_s")
+        with c2:
+            b_raw   = "\n".join(
+                content.get("bullets", []) +
+                ([content.get("main_body","")] if content.get("main_body") else [])
+            )
+            b_edit  = st.text_area("Corpo / Bullets (um por linha):",
+                                    value=b_raw, height=130, key="rd_b")
+
+        content["title"]    = t_edit
+        content["subtitle"] = s_edit
+        content["bullets"]  = [x.strip() for x in b_edit.split("\n") if x.strip()]
+        content["main_body"] = ""
+
+        # 2. Analyze template layout
+        with st.spinner("Analisando layout do template..."):
+            try:
+                if tmpl_lower.endswith(".pptx"):
+                    tmpl_img_bytes = None  # no render available without LibreOffice
+                    tmpl_desc = "Professional corporate slide with blue and gold color scheme, " + \
+                                "icons and structured layout as provided in the PPTX template."
+                else:
+                    tmpl_mime = "image/png" if "png" in tmpl_lower else "image/jpeg"
+                    tmpl_img_bytes = tmpl_bytes
+                    tmpl_desc = ai_vision_call(
+                        client, provider, model, tmpl_bytes, tmpl_mime,
+                        "Describe this slide layout for faithful reproduction: "
+                        "colors, structure, hierarchy, typography, element positions. "
+                        "Be specific (max 300 words)."
+                    )
+            except Exception as e:
+                tmpl_desc = "Professional medical slide layout with blue corporate palette."
+                tmpl_img_bytes = None
+                st.warning(f"Analise visual do template falhou: {e}")
+
+        # 3. Generate PPTX
+        with st.spinner("Gerando PPTX..."):
+            try:
+                if tmpl_lower.endswith(".pptx"):
+                    result_pptx = fill_pptx_template_with_content(tmpl_bytes, content)
+                else:
+                    result_pptx = build_pptx_from_image_bg(
+                        tmpl_bytes, content, tmpl_lower)
+                st.session_state["rd_pptx"] = result_pptx
+            except Exception as e:
+                st.error(f"Erro ao gerar PPTX: {e}")
+                st.session_state["rd_pptx"] = None
+
+        # 4. Generate image with DALL-E
+        if use_dalle and dalle_key:
+            with st.spinner("Gerando imagem com DALL-E 3 (pode demorar ~20s)..."):
+                try:
+                    result_img = generate_slide_image_dalle(dalle_key, content, tmpl_desc)
+                    st.session_state["rd_image"] = result_img
+                except Exception as e:
+                    st.error(f"Erro DALL-E: {e}")
+                    st.session_state["rd_image"] = None
+        else:
+            st.session_state["rd_image"] = None
+
+        st.rerun()
+
+    # Results
+    if st.session_state.get("rd_pptx") or st.session_state.get("rd_image"):
+        st.divider()
+        st.markdown("### Resultado")
+        if st.session_state.get("rd_image"):
+            st.image(st.session_state["rd_image"],
+                     caption="Slide Redesenhado — DALL-E 3", use_column_width=True)
+
+        dl1, dl2, dl3 = st.columns(3)
+        if st.session_state.get("rd_pptx"):
+            dl1.download_button("Baixar PPTX",
+                data=st.session_state["rd_pptx"],
+                file_name="slide_redesenhado.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        if st.session_state.get("rd_image"):
+            dl2.download_button("Baixar PNG",
+                data=st.session_state["rd_image"],
+                file_name="slide_redesenhado.png",
+                mime="image/png")
+        if dl3.button("Novo Redesenho"):
+            st.session_state["rd_pptx"]  = None
+            st.session_state["rd_image"] = None
+            st.rerun()
+
 def main():
+    # ── Authentication gate ────────────────────────────────────────────────
+    if not render_login_page():
+        return  # Not logged in — show only login page
+
+    auth_user = st.session_state.get("auth_user", "")
+    auth_role = st.session_state.get("auth_role", "user")
+
     st.markdown("""<div class="cia-header">
   <h1>CitacaoIA</h1>
   <p>Gestor inteligente de citacoes . Vancouver . APA . ABNT . Chicago . Textos + Apresentacoes + Referencias . PubMed + EMBASE + LILACS + OpenAlex</p>
@@ -3589,16 +4544,32 @@ def main():
     st.session_state["_provider"] = provider
     st.session_state["_model"]    = model
 
+    # Sidebar: user info + logout
+    with st.sidebar:
+        st.divider()
+        st.caption(f"Logado como: **{auth_user}** ({auth_role})")
+        if st.button("Sair (logout)", key="btn_logout"):
+            _append_usage_log(auth_user, "logout")
+            for k in ["auth_user", "auth_role"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.rerun()
+
     for k in ["last_result","last_all_refs","last_final_refs","last_mode","last_revision",
               "last_citation_style","last_vr_result","last_vr_style",
               "last_md_conversion","last_md_conversion_name",
               "last_ev_results","last_ev_claim",
               "ppt_annotated","ppt_report_docx","ppt_slides_info",
-              "ppt_citations","ppt_all_refs","ppt_style","ppt_filename"]:
+              "ppt_citations","ppt_all_refs","ppt_style","ppt_filename",
+              "rd_pptx","rd_image"]:
         if k not in st.session_state:
             st.session_state[k] = None
 
-    tab_bib, tab_citar, tab_rev, tab_vr, tab_conv, tab_ev, tab_ppt = st.tabs([
+    # Admin panel (only for admin role)
+    if auth_role == "admin":
+        render_admin_panel()
+
+    tab_bib, tab_citar, tab_rev, tab_vr, tab_conv, tab_ev, tab_ppt, tab_rd = st.tabs([
         "\U0001f4d6 Biblioteca",
         "\u270d\ufe0f Citar Texto",
         "\U0001f4dd Revisao Editorial",
@@ -3606,6 +4577,7 @@ def main():
         "\U0001f4c4 Converter Docs",
         "\U0001f4a1 Buscar Evidencias",
         "\U0001f4ca Referenciar PPT",
+        "\U0001f3a8 Redesenhar Slide",
     ])
     with tab_bib:
         render_biblioteca_tab()
@@ -3621,6 +4593,13 @@ def main():
         render_evidencias_tab()
     with tab_ppt:
         render_citar_ppt_tab()
+    with tab_rd:
+        render_redesenhar_slide_tab()
+
+    # Log active tab (lightweight — fires on every rerun, deduped by session)
+    if st.session_state.get("_last_log_user") != auth_user:
+        _append_usage_log(auth_user, "session_active", provider)
+        st.session_state["_last_log_user"] = auth_user
 
 
 if __name__ == "__main__":
