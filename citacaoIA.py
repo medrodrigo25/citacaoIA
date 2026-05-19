@@ -274,7 +274,7 @@ def render_login_page() -> bool:
         _ru = _os3.environ.get("ADMIN_RESET_USER","admin")
         st.warning(f"Modo reset ativo — use usuario **{_ru}** e a senha definida em ADMIN_RESET_PASSWORD.")
 
-    tab_login, tab_reg = st.tabs(["Entrar", "Criar conta (convite)"])
+    tab_login, tab_reg, tab_recover = st.tabs(["Entrar", "Criar conta (convite)", "Recuperar Senha"])
 
     with tab_login:
         u = st.text_input("Usuario", key="login_u")
@@ -306,8 +306,78 @@ def render_login_page() -> bool:
                 else:
                     st.error(msg)
 
+    with tab_recover:
+        st.caption("Para redefinir sua senha voce precisa de um **codigo de recuperacao** gerado pelo administrador.")
+        st.info("**Como funciona:**\n1. O admin gera um codigo de recuperacao no painel de administracao.\n2. O admin envia o codigo para voce.\n3. Voce usa o codigo aqui para criar uma nova senha.")
+
+        rec_user   = st.text_input("Seu usuario", key="rec_username", placeholder="Digite seu usuario")
+        rec_code   = st.text_input("Codigo de recuperacao", key="rec_code",
+                                   placeholder="Ex: RC-A3F7B2C1").strip().upper()
+        rec_pw     = st.text_input("Nova senha",    key="rec_new_pw",  type="password")
+        rec_pw2    = st.text_input("Confirmar nova senha", key="rec_new_pw2", type="password")
+
+        if st.button("Redefinir senha", type="primary", use_container_width=True, key="btn_recover"):
+            if not rec_user.strip():
+                st.error("Informe seu usuario.")
+            elif not rec_code.strip():
+                st.error("Informe o codigo de recuperacao.")
+            elif len(rec_pw) < 6:
+                st.error("A nova senha deve ter ao menos 6 caracteres.")
+            elif rec_pw != rec_pw2:
+                st.error("As senhas nao coincidem.")
+            else:
+                # Validate recovery code
+                rec_codes = db.get("recovery_codes", {})
+                uname = rec_user.strip().lower()
+                if rec_code not in rec_codes:
+                    st.error("Codigo de recuperacao invalido.")
+                elif rec_codes[rec_code].get("used"):
+                    st.error("Este codigo ja foi utilizado.")
+                elif rec_codes[rec_code].get("username","") not in ("", uname):
+                    st.error("Codigo nao valido para este usuario.")
+                else:
+                    from datetime import datetime as _dt
+                    exp = rec_codes[rec_code].get("expires_at","")
+                    if exp and _dt.fromisoformat(exp) < _dt.now():
+                        st.error("Codigo expirado. Solicite um novo ao administrador.")
+                    elif uname not in db["users"]:
+                        st.error("Usuario nao encontrado.")
+                    else:
+                        db["users"][uname]["password_hash"] = _hash_pw(rec_pw)
+                        db["recovery_codes"][rec_code]["used"] = True
+                        _save_auth_db(db)
+                        st.success("Senha redefinida com sucesso! Faca login na aba 'Entrar'.")
+
     st.markdown("</div>", unsafe_allow_html=True)
     return False
+
+
+def _gen_recovery_code(db: dict, username: str, expires_hours: int = 24) -> str:
+    """Generate a one-time recovery code for password reset."""
+    from datetime import datetime, timedelta
+    if "recovery_codes" not in db:
+        db["recovery_codes"] = {}
+    code = "RC-" + str(_uuid.uuid4())[:8].upper()
+    db["recovery_codes"][code] = {
+        "username":   username.strip().lower(),
+        "created_at": datetime.now().isoformat(),
+        "expires_at": (datetime.now() + timedelta(hours=expires_hours)).isoformat(),
+        "used":       False,
+    }
+    _save_auth_db(db)
+    return code
+
+
+def _admin_reset_password(db: dict, username: str, new_pw: str) -> tuple:
+    """Admin directly resets a user's password (no old password needed)."""
+    username = username.strip().lower()
+    if username not in db["users"]:
+        return False, "Usuario nao encontrado."
+    if len(new_pw) < 6:
+        return False, "Nova senha deve ter ao menos 6 caracteres."
+    db["users"][username]["password_hash"] = _hash_pw(new_pw)
+    _save_auth_db(db)
+    return True, f"Senha do usuario '{username}' redefinida com sucesso."
 
 
 def render_admin_panel():
@@ -317,8 +387,8 @@ def render_admin_panel():
     log = _load_usage_log()
     auth_user = st.session_state.get("auth_user", "admin")
 
-    a_tab1, a_tab2, a_tab3, a_tab4 = st.tabs(
-    ["Usuarios", "Convidar Usuario", "Log de Uso", "Minha Conta"]
+    a_tab1, a_tab2, a_tab3, a_tab4, a_tab5 = st.tabs(
+    ["Usuarios", "Convidar Usuario", "Recuperar Senha", "Log de Uso", "Minha Conta"]
     )
 
     # ── TAB 1: Users ──────────────────────────────────────────────────────
@@ -384,8 +454,67 @@ def render_admin_panel():
         else:
             st.info("Nenhum codigo gerado ainda.")
 
-    # ── TAB 3: Usage log ──────────────────────────────────────────────────
+    # ── TAB 3: Recuperar Senha ────────────────────────────────────────────
     with a_tab3:
+        st.markdown("### Recuperacao de Senha de Usuarios")
+        all_users = list(db["users"].keys())
+
+        st.markdown("#### Opção 1 — Reset direto (admin define nova senha)")
+        rst_user = st.selectbox("Usuario para resetar:", ["— selecione —"] + all_users, key="rst_u_sel")
+        rst_pw   = st.text_input("Nova senha:", type="password", key="rst_pw_inp")
+        rst_pw2  = st.text_input("Confirmar nova senha:", type="password", key="rst_pw2_inp")
+        if st.button("Redefinir senha agora", key="btn_rst_direct", type="primary"):
+            if rst_user == "— selecione —":
+                st.error("Selecione um usuario.")
+            elif len(rst_pw) < 6:
+                st.error("Senha deve ter ao menos 6 caracteres.")
+            elif rst_pw != rst_pw2:
+                st.error("As senhas nao coincidem.")
+            else:
+                ok, msg = _admin_reset_password(db, rst_user, rst_pw)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+        st.markdown("---")
+        st.markdown("#### Opção 2 — Gerar codigo de recuperacao (usuario redefine sozinho)")
+        st.caption("O usuario entra na tela de login → aba 'Recuperar Senha' e usa o codigo.")
+        rc_user  = st.selectbox("Usuario:", ["— selecione —"] + all_users, key="rc_u_sel")
+        rc_hours = st.number_input("Validade do codigo (horas):", 1, 72, 24, key="rc_hours")
+        if st.button("Gerar codigo de recuperacao", key="btn_gen_rc"):
+            if rc_user == "— selecione —":
+                st.error("Selecione um usuario.")
+            else:
+                code = _gen_recovery_code(db, rc_user, int(rc_hours))
+                st.session_state["last_recovery_code"] = code
+                st.session_state["last_recovery_user"] = rc_user
+                st.rerun()
+
+        if st.session_state.get("last_recovery_code"):
+            code  = st.session_state["last_recovery_code"]
+            ruser = st.session_state.get("last_recovery_user","")
+            st.success(f"Codigo gerado para **{ruser}**! Copie e envie ao usuario:")
+            st.code(code, language=None)
+            st.caption(f"Valido por {rc_hours} hora(s). O usuario acessa o app → aba 'Recuperar Senha' e usa este codigo.")
+
+        st.markdown("---")
+        st.markdown("**Codigos de recuperacao gerados:**")
+        rc_rows = [
+            {"Codigo": c,
+             "Usuario": d.get("username",""),
+             "Expira": d.get("expires_at","")[:16].replace("T"," "),
+             "Usado": "Sim" if d.get("used") else "Nao"}
+            for c, d in db.get("recovery_codes", {}).items()
+        ]
+        if rc_rows:
+            import pandas as _pdr
+            st.dataframe(_pdr.DataFrame(rc_rows), use_container_width=True)
+        else:
+            st.info("Nenhum codigo de recuperacao gerado ainda.")
+
+    # ── TAB 4: Usage log ──────────────────────────────────────────────────
+    with a_tab4:
         if log:
             import pandas as _pd3
             df = _pd3.DataFrame(log[-500:][::-1])
@@ -402,8 +531,8 @@ def render_admin_panel():
         else:
             st.info("Nenhuma acao registrada ainda.")
 
-    # ── TAB 4: Change password ────────────────────────────────────────────
-    with a_tab4:
+    # ── TAB 5: Change password ────────────────────────────────────────────
+    with a_tab5:
         st.markdown("**Alterar minha senha**")
         old_pw  = st.text_input("Senha atual", type="password", key="chpw_old")
         new_pw  = st.text_input("Nova senha",  type="password", key="chpw_new")
@@ -987,24 +1116,53 @@ def get_ai_client(provider: str, api_key: str):
         return OpenAI(api_key=api_key)
 
 def ai_call(client, provider: str, model: str, prompt: str, max_tokens: int = 8000) -> str:
-    if provider == "Anthropic (Claude)":
-        resp = client.messages.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role":"user","content":prompt}])
-        return resp.content[0].text
-    elif provider == "Google (Gemini)":
-        from google import genai as _genai
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=_genai.types.GenerateContentConfig(max_output_tokens=max_tokens),
-        )
-        return resp.text
-    else:  # OpenAI
-        resp = client.chat.completions.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role":"user","content":prompt}])
-        return resp.choices[0].message.content
+    """Call AI API with automatic retry on rate limit (429) errors.
+    Implements exponential backoff: waits 15s, 30s, 60s between retries."""
+    import time as _time
+
+    # Limit prompt size to avoid hitting 50k input token/min rate limit
+    # ~4 chars per token → 50k tokens ≈ 200k chars; stay under 40k tokens = 160k chars
+    MAX_PROMPT_CHARS = 12000  # conservative per-call limit
+    if len(prompt) > MAX_PROMPT_CHARS:
+        # Truncate the text block inside the prompt, keeping instructions intact
+        prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[TEXTO TRUNCADO PARA LIMITE DE TOKENS]"
+
+    max_retries = 3
+    wait_times  = [15, 30, 60]
+
+    for attempt in range(max_retries + 1):
+        try:
+            if provider == "Anthropic (Claude)":
+                resp = client.messages.create(
+                    model=model, max_tokens=max_tokens,
+                    messages=[{"role":"user","content":prompt}])
+                return resp.content[0].text
+            elif provider == "Google (Gemini)":
+                from google import genai as _genai
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=_genai.types.GenerateContentConfig(max_output_tokens=max_tokens),
+                )
+                return resp.text
+            else:  # OpenAI
+                resp = client.chat.completions.create(
+                    model=model, max_tokens=max_tokens,
+                    messages=[{"role":"user","content":prompt}])
+                return resp.choices[0].message.content
+
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = ("429" in err_str or "rate_limit" in err_str.lower()
+                             or "too many requests" in err_str.lower()
+                             or "overloaded" in err_str.lower())
+            if is_rate_limit and attempt < max_retries:
+                wait = wait_times[attempt]
+                st.warning(f"⏳ Limite de taxa da API atingido. Aguardando {wait}s antes de tentar novamente "
+                           f"(tentativa {attempt+1}/{max_retries})...")
+                _time.sleep(wait)
+                continue
+            raise  # re-raise if not rate limit or max retries exceeded
 
 def repair_truncated_json(raw: str) -> dict | None:
     """Recover partial paragraphs from a truncated JSON response using a depth-counter parser."""
@@ -1088,9 +1246,9 @@ def extract_json_from_ai(text: str) -> dict | None:
     return None
 
 
-CHUNK_CHAR_LIMIT = 2800  # default max chars per chunk
-CHUNK_CHAR_LIMIT_GEMINI = 1800  # Gemini needs smaller chunks to avoid truncation
-CHUNK_CHAR_LIMIT_OPENAI = 2800
+CHUNK_CHAR_LIMIT = 1800  # default max chars per chunk (reduced to avoid 50k token/min rate limit)
+CHUNK_CHAR_LIMIT_GEMINI = 1200  # Gemini needs smaller chunks to avoid truncation
+CHUNK_CHAR_LIMIT_OPENAI = 1800
 
 
 
@@ -1433,6 +1591,8 @@ def run_pipeline(client, provider, model, main_text, ref_files, mode, library_re
             all_queries.extend(p.get("pubmed_queries", []))
         upd(20 + int(10 * (ci+1) / n_chunks),
             f"Analise parte {ci+1}/{n_chunks}: {len(all_queries)} queries geradas")
+        if ci < n_chunks - 1:
+            time.sleep(2)  # 2s entre chamadas para evitar rate limit 50k tokens/min
 
     # Dedup queries; allow up to 4 queries per chunk (minimum 8)
     all_queries  = list(dict.fromkeys(q for q in all_queries if q.strip()))

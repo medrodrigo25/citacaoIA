@@ -1,0 +1,17 @@
+{
+  "users": {
+    "rodrigoborghi": {
+      "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",
+      "role": "admin",
+      "created_at": "2026-05-19T09:14:07.436332",
+      "invite_code_used": "SYSTEM"
+    },
+    "admin": {
+      "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",
+      "role": "admin",
+      "created_at": "2026-05-19T17:07:24.254262",
+      "invite_code_used": "SYSTEM"
+    }
+  },
+  "invite_codes": {}
+}
