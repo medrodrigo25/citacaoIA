@@ -4,12 +4,15 @@ Versao: 2.0
 Uso: streamlit run citacaoIA.py
 """
 
-import re, json, time, os
+import re, json, time, os, threading as _threading
 from datetime import datetime
 from io import BytesIO
 
 import streamlit as st
 import requests
+
+# Global task store for background pipeline runs
+_PIPELINE_TASKS: dict = {}
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -998,6 +1001,59 @@ def insert_citations_ai(client, provider, model, text, refs, mode, citation_styl
         result["_ref_map"]      = ref_map
     return result
 
+
+
+def insert_citations_ai_bg(client, provider, model, text, refs, mode,
+                            citation_style="Vancouver", upd_fn=None) -> dict:
+    """St-free version of insert_citations_ai for background thread use."""
+    ref_catalogue = _build_ref_catalogue(refs)
+    chunk_limit   = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
+    chunks        = chunk_text(text, max_chars=chunk_limit)
+
+    all_paragraphs  = []
+    all_changes     = []
+    chunk_summaries = []
+
+    def _upd(idx, n):
+        if upd_fn:
+            pct = 65 + int(20 * idx / max(n, 1))
+            upd_fn(min(pct, 85), f"Inserindo citacoes: parte {idx}/{n}...")
+
+    if len(chunks) == 1:
+        result = _insert_citations_chunk(client, provider, model, chunks[0],
+                                         ref_catalogue, mode, citation_style)
+    else:
+        for idx, chunk in enumerate(chunks, 1):
+            _upd(idx, len(chunks))
+            res = _insert_citations_chunk(client, provider, model, chunk,
+                                          ref_catalogue, mode, citation_style)
+            if "error" in res and "paragraphs" not in res:
+                all_paragraphs.append({
+                    "original": chunk[:200] + "...",
+                    "modified": chunk[:200] + "...",
+                    "refs_used": [], "changes": [f"Erro chunk {idx}"], "changed": False,
+                })
+            else:
+                all_paragraphs.extend(res.get("paragraphs", []))
+                all_changes.extend(res.get("changes_detail", []))
+                if res.get("summary"):
+                    chunk_summaries.append(f"Parte {idx}: {res['summary']}")
+        result = {
+            "paragraphs":     all_paragraphs,
+            "reference_map":  {},
+            "summary":        " | ".join(chunk_summaries) or "Processado em multiplas partes.",
+            "changes_detail": all_changes,
+            "_chunked": True,
+        }
+
+    paras = result.get("paragraphs", [])
+    if paras:
+        renumbered, ordered_refs, ref_map = _renumber_citations(paras, refs)
+        result["paragraphs"]  = renumbered
+        result["_final_refs"] = ordered_refs
+        result["_ref_map"]    = ref_map
+    return result
+
 # =============================================================================
 # MAIN PIPELINE
 # =============================================================================
@@ -1611,6 +1667,170 @@ def render_biblioteca_tab():
 # CITAR TAB
 # =============================================================================
 
+
+def parse_manual_refs(text: str) -> list:
+    """Parse a pasted numbered reference list into ref dicts."""
+    import re as _re
+    refs = []
+    # Split on numbered items (1. / 1) or blank lines between entries
+    raw_lines = _re.split(r'\n(?=\d+[\.\.)])', text.strip())
+    if len(raw_lines) == 1:
+        raw_lines = [l for l in text.strip().split("\n") if l.strip()]
+    for line in raw_lines:
+        line = _re.sub(r'^\d+[\.\)]\s*', '', line.strip())
+        if not line:
+            continue
+        ref = {"title": line[:200], "authors": "", "year": "", "journal": "", "raw": line}
+        yr = _re.search(r'\b(19|20)\d{2}\b', line)
+        if yr:
+            ref["year"] = yr.group()
+        parts = [p.strip() for p in line.split(".") if p.strip()]
+        if len(parts) >= 2:
+            ref["authors"] = parts[0]
+            ref["title"]   = parts[1]
+        if len(parts) >= 3:
+            ref["journal"] = parts[2]
+        refs.append(ref)
+    return refs
+
+
+def _pipeline_worker(task_id: str, provider: str, client_cfg: dict,
+                     main_text: str, ref_bytes: list,
+                     mode: str, library_refs: list,
+                     citation_style: str, manual_refs: list):
+    """Background thread: runs pipeline without any st.* calls."""
+    import re as _re, json as _json, time as _time, traceback as _tb
+    task = _PIPELINE_TASKS[task_id]
+
+    def upd(pct, msg):
+        task["progress"] = int(pct)
+        task["msg"]      = msg
+
+    try:
+        upd(0, "Iniciando...")
+
+        # Rebuild AI client inside thread (can't pickle Streamlit UploadedFile)
+        from anthropic import Anthropic
+        from openai import OpenAI
+        import google.genai as genai
+
+        api_key  = client_cfg["api_key"]
+        model    = client_cfg["model"]
+
+        if provider == "Anthropic (Claude)":
+            client = Anthropic(api_key=api_key)
+        elif provider == "OpenAI":
+            client = OpenAI(api_key=api_key)
+        else:
+            client = genai.Client(api_key=api_key)
+
+        # 1. Extract PDF metadata
+        ref_metadata = list(library_refs)
+        ref_metadata.extend(manual_refs)
+        if ref_bytes:
+            upd(5, f"Analisando {len(ref_bytes)} artigo(s) de referencia...")
+            for i, (fname, fbytes) in enumerate(ref_bytes):
+                pdf_text = extract_text_from_pdf(fbytes)
+                meta     = extract_ref_metadata_ai(client, provider, model, pdf_text, fname)
+                ref_metadata.append(meta)
+                upd(5 + int(15*(i+1)/len(ref_bytes)),
+                    f"Artigo {i+1}/{len(ref_bytes)}: {meta.get('title','')[:50]}...")
+
+        # 2. Chunk text — cap at 15 chunks for the identify phase to avoid timeouts
+        chunk_limit = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
+        text_chunks = chunk_text(main_text, max_chars=chunk_limit)
+        MAX_ID_CHUNKS = 15
+        id_chunks   = text_chunks[:MAX_ID_CHUNKS]
+        n_id        = len(id_chunks)
+        upd(20, f"Identificando necessidades em {n_id} parte(s) (de {len(text_chunks)} total)...")
+
+        all_queries = []
+        for ci, chunk in enumerate(id_chunks):
+            if task.get("cancelled"):
+                task["status"] = "cancelled"
+                return
+            needs_data = identify_citation_needs(client, provider, model, chunk, mode)
+            for p in needs_data.get("paragraphs", []):
+                all_queries.extend(p.get("pubmed_queries", []))
+            upd(20 + int(10*(ci+1)/n_id),
+                f"Analise parte {ci+1}/{n_id}: {len(all_queries)} queries geradas")
+
+        all_queries = list(dict.fromkeys(q for q in all_queries if q.strip()))
+        MAX_SEARCHES = 25
+        all_queries  = all_queries[:MAX_SEARCHES]
+
+        # 3. Fallback queries
+        if not all_queries:
+            upd(30, "Gerando queries a partir do topico do texto...")
+            topic_prompt = (
+                "Read this scientific text and generate 6 specific PubMed search queries in English. "
+                "Return ONLY a JSON array of strings.\n\nTEXT:\n" + main_text[:1500]
+            )
+            raw_q = ai_call(client, provider, model, topic_prompt, max_tokens=500)
+            try:
+                m = _re.search(r"\[.*\]", raw_q, _re.DOTALL)
+                if m:
+                    all_queries = _json.loads(m.group())[:8]
+            except Exception:
+                pass
+
+        # 4. Multi-source search
+        web_refs = []
+        if all_queries:
+            upd(35, f"Buscando em {len(all_queries)} queries x 4 bases...")
+            for i, q in enumerate(all_queries):
+                if task.get("cancelled"):
+                    task["status"] = "cancelled"
+                    return
+                pct = 35 + int(25*(i+1)/len(all_queries))
+                upd(pct, f"Busca {i+1}/{len(all_queries)}: {q[:55]}")
+                web_refs.extend(multi_source_search(q, max_per_source=2))
+                _time.sleep(0.25)
+            for q in all_queries[:4]:
+                web_refs.extend(search_europe_pmc(q, max_results=2, source_filter="PPR"))
+
+        seen, unique_web = set(), []
+        for r in web_refs:
+            t = r.get("title", "").lower()[:80]
+            if t not in seen:
+                seen.add(t)
+                unique_web.append(r)
+
+        all_refs = ref_metadata + unique_web
+        upd(62, f"Total: {len(all_refs)} refs ({len(ref_metadata)} locais/manuais + {len(unique_web)} web)")
+
+        # 5. Insert citations (over ALL original chunks, not just id_chunks)
+        upd(65, "Inserindo citacoes com IA...")
+        try:
+            result = insert_citations_ai_bg(client, provider, model, main_text,
+                                            all_refs, mode, citation_style, upd_fn=upd)
+        except Exception as e_ins:
+            result = {"error": str(e_ins), "paragraphs": [], "reference_map": {}}
+
+        upd(90, "Montando resultado final...")
+
+        final_ref_list = result.get("_final_refs", [])
+        if not final_ref_list:
+            ref_map = result.get("reference_map", {})
+            seen_idx = []
+            for num_str, ref_id in sorted(ref_map.items(),
+                                          key=lambda x: int(x[0]) if x[0].isdigit() else 999):
+                idx_str = _re.sub(r"[^0-9]", "", str(ref_id))
+                if idx_str:
+                    idx = int(idx_str) - 1
+                    if 0 <= idx < len(all_refs) and idx not in seen_idx:
+                        seen_idx.append(idx)
+                        final_ref_list.append(all_refs[idx])
+
+        upd(100, "Concluido!")
+        task["result"]  = (result, all_refs, final_ref_list)
+        task["status"]  = "done"
+
+    except Exception as e:
+        task["error"]    = str(e)
+        task["traceback"] = _tb.format_exc()
+        task["status"]   = "error"
+
 def render_citar_tab():
     st.markdown("### Processar Texto")
 
@@ -1658,16 +1878,75 @@ def render_citar_tab():
     st.caption("Upload de PDFs dos artigos de referencia para extracao de metadados. "
                "Sem upload, o app busca referencias automaticamente em "
                "PubMed, LILACS, Europe PMC e OpenAlex.")
-    ref_files = st.file_uploader("PDFs de referencia", type=["pdf"],
-                                  accept_multiple_files=True, key="ref_upload")
+
+    ref_tab_pdf, ref_tab_text = st.tabs(["Upload PDFs", "Colar lista de referencias"])
+    with ref_tab_pdf:
+        ref_files = st.file_uploader("PDFs de referencia", type=["pdf"],
+                                      accept_multiple_files=True, key="ref_upload")
+        if ref_files:
+            st.info(f"{len(ref_files)} PDF(s) de referencia carregado(s).")
+    with ref_tab_text:
+        manual_ref_text = st.text_area(
+            "Cole sua lista de referencias aqui:",
+            height=180,
+            placeholder=(
+                "1. Smith AB, Jones CD. Titulo do artigo. J Psychiatry. 2023;45(2):123-130.\n"
+                "2. Garcia L et al. Another study. Lancet. 2022;399:1234-1240.\n"
+                "(Pode ser numerada ou nao — uma referencia por linha)"
+            ),
+            key="manual_refs_input",
+        )
 
     use_library  = st.checkbox("Incluir artigos da biblioteca local como referencias", value=True)
     library_refs = load_library() if use_library else []
 
-    if ref_files:
-        st.info(f"{len(ref_files)} PDF(s) de referencia carregado(s).")
-
     st.divider()
+
+    # ── Background processing status ──────────────────────────────────────────
+    active_task_id = st.session_state.get("pipeline_task_id")
+    if active_task_id and active_task_id in _PIPELINE_TASKS:
+        task   = _PIPELINE_TASKS[active_task_id]
+        status = task.get("status", "running")
+        pct    = task.get("progress", 0)
+        msg    = task.get("msg", "Processando...")
+
+        st.progress(pct / 100, text=f"**{msg}**")
+
+        if status == "running":
+            col_info, col_cancel = st.columns([4, 1])
+            col_info.info(
+                "Processando em segundo plano — voce pode navegar entre as abas normalmente."
+            )
+            if col_cancel.button("Cancelar", key="btn_cancel_pipe"):
+                task["cancelled"] = True
+                del st.session_state["pipeline_task_id"]
+                st.rerun()
+            time.sleep(0.8)
+            st.rerun()
+
+        elif status == "done":
+            result, all_refs, final_ref_list = task["result"]
+            st.session_state["last_citation_style"] = task.get("citation_style", "Vancouver")
+            st.session_state["last_result"]     = result
+            st.session_state["last_all_refs"]   = all_refs
+            st.session_state["last_final_refs"] = final_ref_list
+            st.session_state["last_mode"]       = task.get("mode", "add")
+            del st.session_state["pipeline_task_id"]
+            _PIPELINE_TASKS.pop(active_task_id, None)
+            st.rerun()
+
+        elif status in ("error", "cancelled"):
+            if status == "error":
+                st.error(f"Erro no processamento: {task.get('error', 'Erro desconhecido')}")
+                with st.expander("Detalhes tecnicos"):
+                    st.code(task.get("traceback", ""))
+            else:
+                st.warning("Processamento cancelado.")
+            del st.session_state["pipeline_task_id"]
+            _PIPELINE_TASKS.pop(active_task_id, None)
+
+        return  # don't show button while a task is active
+
     run_btn = st.button("Processar texto com IA", type="primary",
                         use_container_width=True, disabled=not api_key)
 
@@ -1691,26 +1970,33 @@ def render_citar_tab():
             st.error("Insira o texto principal (upload ou colagem).")
             return
 
-        try:
-            client = get_ai_client(provider, api_key)
-        except Exception as e:
-            st.error(f"Erro ao inicializar cliente IA: {e}")
+        if not api_key:
+            st.error("Configure a chave de API na barra lateral.")
             return
 
-        with st.spinner("Processando... nao feche esta pagina."):
-          try:
-            result, all_refs, final_ref_list = run_pipeline(
-                client, provider, model, main_text, ref_files, mode_key, library_refs, citation_style)
-          except Exception as e_pipe:
-            st.error(f"Erro no processamento: {e_pipe}")
-            import traceback; st.expander("Detalhes do erro").code(traceback.format_exc())
-            return
-        st.session_state["last_citation_style"] = citation_style
-        st.session_state["last_result"]     = result
-        st.session_state["last_all_refs"]   = all_refs
-        st.session_state["last_final_refs"] = final_ref_list
-        st.session_state["last_mode"]       = mode_key
-        st.rerun()  # force re-render so results appear immediately
+        # Read uploaded file bytes NOW (before thread — UploadedFile is not thread-safe)
+        ref_bytes = [(f.name, f.read()) for f in ref_files] if ref_files else []
+        manual_refs = parse_manual_refs(manual_ref_text) if manual_ref_text.strip() else []
+
+        task_id = f"pipe_{time.time():.0f}"
+        _PIPELINE_TASKS[task_id] = {
+            "status":         "running",
+            "progress":       0,
+            "msg":            "Iniciando...",
+            "citation_style": citation_style,
+            "mode":           mode_key,
+        }
+        st.session_state["pipeline_task_id"] = task_id
+
+        client_cfg = {"api_key": api_key, "model": model}
+        t = _threading.Thread(
+            target=_pipeline_worker,
+            args=(task_id, provider, client_cfg, main_text, ref_bytes,
+                  mode_key, library_refs, citation_style, manual_refs),
+            daemon=True,
+        )
+        t.start()
+        st.rerun()
 
     _lr = st.session_state.get("last_result")
     if _lr is not None:  # explicit None check (empty dict is valid result)
