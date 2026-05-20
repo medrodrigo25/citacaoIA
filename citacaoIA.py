@@ -2377,7 +2377,63 @@ def render_citar_tab():
         st.warning("Configure a chave API na barra lateral antes de processar.")
         return
 
-    col_mode, col_style = st.columns([2,1])
+    # ── Check if a background task is running ────────────────────────────
+    task_id = st.session_state.get("_citar_task_id")
+    if task_id and task_id in _PIPELINE_TASKS:
+        task = _PIPELINE_TASKS[task_id]
+        status = task.get("status", "running")
+
+        if status == "running":
+            pct = task.get("progress", 0)
+            msg = task.get("msg", "Processando...")
+            st.info(f"⏳ **Processando em background...** O app continua responsivo.")
+            st.progress(pct / 100, text=f"{pct}% — {msg}")
+            st.caption("A pagina atualiza automaticamente a cada 3 segundos.")
+
+            col_cancel, col_space = st.columns([1, 3])
+            with col_cancel:
+                if st.button("🛑 Cancelar processamento", key="btn_cancel_pipe"):
+                    task["cancelled"] = True
+                    st.session_state.pop("_citar_task_id", None)
+                    st.warning("Processamento cancelado.")
+                    st.rerun()
+
+            # Auto-refresh every 3 seconds while running
+            time.sleep(3)
+            st.rerun()
+            return
+
+        elif status == "done":
+            result, all_refs, final_ref_list = task["result"]
+            st.session_state["last_citation_style"] = task.get("citation_style", "Vancouver")
+            st.session_state["last_result"]          = result
+            st.session_state["last_all_refs"]         = all_refs
+            st.session_state["last_final_refs"]       = final_ref_list
+            st.session_state["last_mode"]             = task.get("mode", "add")
+            st.session_state.pop("_citar_task_id", None)
+            del _PIPELINE_TASKS[task_id]
+            st.success("✅ Processamento concluído com sucesso!")
+            st.rerun()
+            return
+
+        elif status == "error":
+            err = task.get("error", "Erro desconhecido")
+            tb  = task.get("traceback", "")
+            st.session_state.pop("_citar_task_id", None)
+            del _PIPELINE_TASKS[task_id]
+            st.error(f"❌ **Erro no processamento:** {err}")
+            if tb:
+                with st.expander("📋 Detalhes técnicos do erro"):
+                    st.code(tb)
+            st.info("💡 Tente novamente. Se o erro persistir, reduza o tamanho do texto ou mude o modelo para claude-haiku.")
+
+        elif status == "cancelled":
+            st.session_state.pop("_citar_task_id", None)
+            if task_id in _PIPELINE_TASKS:
+                del _PIPELINE_TASKS[task_id]
+
+    # ── Config UI ─────────────────────────────────────────────────────────
+    col_mode, col_style = st.columns([2, 1])
     with col_mode:
         mode = st.radio(
             "Modo de operacao:",
@@ -2400,7 +2456,7 @@ def render_citar_tab():
     pasted_text = ""
     with tab_up:
         text_file = st.file_uploader("Upload PDF, Word ou Markdown (.md)",
-                                     type=["pdf","docx","md"],
+                                     type=["pdf", "docx", "md"],
                                      key="main_upload")
         if text_file:
             st.success(f"{text_file.name} carregado")
@@ -2417,7 +2473,7 @@ def render_citar_tab():
     ref_tab_pdf, ref_tab_text = st.tabs(["Upload PDFs", "Colar lista de referencias"])
     with ref_tab_pdf:
         ref_files = st.file_uploader("PDFs de referencia", type=["pdf"],
-                                      accept_multiple_files=True, key="ref_upload")
+                                     accept_multiple_files=True, key="ref_upload")
         if ref_files:
             st.info(f"{len(ref_files)} PDF(s) de referencia carregado(s).")
     with ref_tab_text:
@@ -2437,10 +2493,11 @@ def render_citar_tab():
 
     st.divider()
 
-    run_btn = st.button("Processar texto com IA", type="primary",
+    run_btn = st.button("🚀 Processar texto com IA", type="primary",
                         use_container_width=True, disabled=not api_key)
 
     if run_btn:
+        # ── Extract text ──────────────────────────────────────────────────
         main_text = ""
         if text_file:
             b  = text_file.read()
@@ -2451,8 +2508,6 @@ def render_citar_tab():
                 main_text = b.decode("utf-8", errors="replace")
             else:
                 main_text = extract_text_from_docx(b)
-            if main_text.startswith("Erro ao ler"):
-                st.error(main_text); return
         else:
             main_text = pasted_text.strip()
 
@@ -2460,48 +2515,53 @@ def render_citar_tab():
             st.error("Insira o texto principal (upload ou colagem).")
             return
 
-        if not api_key:
-            st.error("Configure a chave de API na barra lateral.")
-            return
+        # Read ref file bytes before handing to thread
+        ref_bytes = []
+        if ref_files:
+            for rf in ref_files:
+                ref_bytes.append((rf.name, rf.read()))
 
-        # Parse manual refs if provided
-        extra_refs = parse_manual_refs(manual_ref_text) if manual_ref_text.strip() else []
-        # Prepend manual refs to library_refs so they are always included
+        extra_refs       = parse_manual_refs(manual_ref_text) if manual_ref_text.strip() else []
         combined_library = extra_refs + library_refs
 
-        try:
-            client = get_ai_client(provider, api_key)
-        except Exception as e:
-            st.error(f"Erro ao inicializar cliente IA: {e}")
-            return
+        # ── Launch background thread ──────────────────────────────────────
+        import uuid as _uuid2
+        task_id = str(_uuid2.uuid4())[:8]
+        _PIPELINE_TASKS[task_id] = {
+            "status":   "running",
+            "progress": 0,
+            "msg":      "Iniciando...",
+            "result":   None,
+            "error":    None,
+            "traceback": None,
+            "cancelled": False,
+            "citation_style": citation_style,
+            "mode": mode_key,
+        }
+        st.session_state["_citar_task_id"] = task_id
 
-        try:
-            result, all_refs, final_ref_list = run_pipeline(
-                client, provider, model, main_text,
-                ref_files if ref_files else [],
-                mode_key, combined_library, citation_style
-            )
-        except Exception as e:
-            import traceback as _tb
-            st.error(f"Erro no processamento: {e}")
-            with st.expander("Detalhes do erro"):
-                st.code(_tb.format_exc())
-            return
-
-        st.session_state["last_citation_style"] = citation_style
-        st.session_state["last_result"]         = result
-        st.session_state["last_all_refs"]        = all_refs
-        st.session_state["last_final_refs"]      = final_ref_list
-        st.session_state["last_mode"]            = mode_key
+        t = _threading.Thread(
+            target=_pipeline_worker,
+            args=(task_id, provider,
+                  {"api_key": api_key, "model": model},
+                  main_text, ref_bytes,
+                  mode_key, combined_library,
+                  citation_style, extra_refs),
+            daemon=True,
+        )
+        t.start()
+        st.info("⏳ Processamento iniciado em background. A página atualiza automaticamente.")
+        time.sleep(1)
         st.rerun()
 
+    # ── Display previous results ──────────────────────────────────────────
     _lr = st.session_state.get("last_result")
-    if _lr is not None:  # explicit None check (empty dict is valid result)
+    if _lr is not None:
         display_results(
             _lr,
             st.session_state.get("last_all_refs") or [],
             st.session_state.get("last_final_refs") or [],
-            st.session_state.get("last_mode","add"),
+            st.session_state.get("last_mode", "add"),
         )
 
 
