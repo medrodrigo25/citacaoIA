@@ -2251,9 +2251,10 @@ def _pipeline_worker(task_id: str, provider: str, client_cfg: dict,
             logs.pop(0)
 
     try:
-        upd(0, "Iniciando...")
+        upd(1, "Thread iniciada — carregando bibliotecas...")
 
         # Rebuild AI client inside thread (can't pickle Streamlit UploadedFile)
+        upd(2, "Importando bibliotecas de IA...")
         from anthropic import Anthropic
         from openai import OpenAI
         import google.genai as genai
@@ -2261,12 +2262,15 @@ def _pipeline_worker(task_id: str, provider: str, client_cfg: dict,
         api_key  = client_cfg["api_key"]
         model    = client_cfg["model"]
 
+        upd(4, f"Conectando ao provedor {provider}...")
         if provider == "Anthropic (Claude)":
             client = Anthropic(api_key=api_key)
         elif provider == "OpenAI":
             client = OpenAI(api_key=api_key)
         else:
             client = genai.Client(api_key=api_key)
+
+        upd(5, f"Conectado. Preparando texto ({len(main_text):,} caracteres)...")
 
         # 1. Extract PDF metadata
         ref_metadata = list(library_refs)
