@@ -2238,8 +2238,17 @@ def _pipeline_worker(task_id: str, provider: str, client_cfg: dict,
     task = _PIPELINE_TASKS[task_id]
 
     def upd(pct, msg):
+        import time as _t_upd
         task["progress"] = int(pct)
         task["msg"]      = msg
+        elapsed = _t_upd.time() - task.get("started_at", _t_upd.time())
+        mins, secs = divmod(int(elapsed), 60)
+        ts = f"{mins:02d}:{secs:02d}"
+        entry = f"[{ts}] {int(pct):3d}% — {msg}"
+        logs = task.setdefault("logs", [])
+        logs.append(entry)
+        if len(logs) > 30:
+            logs.pop(0)
 
     try:
         upd(0, "Iniciando...")
@@ -2384,15 +2393,41 @@ def render_citar_tab():
         status = task.get("status", "running")
 
         if status == "running":
-            pct = task.get("progress", 0)
-            msg = task.get("msg", "Processando...")
-            st.info(f"⏳ **Processando em background...** O app continua responsivo.")
-            st.progress(pct / 100, text=f"{pct}% — {msg}")
-            st.caption("A pagina atualiza automaticamente a cada 3 segundos.")
+            import time as _t_disp
+            pct      = task.get("progress", 0)
+            msg      = task.get("msg", "Processando...")
+            logs     = task.get("logs", [])
+            started  = task.get("started_at", _t_disp.time())
+            elapsed  = _t_disp.time() - started
+            mins, secs = divmod(int(elapsed), 60)
+            elapsed_str = f"{mins:02d}:{secs:02d}"
 
+            # Header
+            st.markdown(
+                f"<div style='background:#1e3a5f;color:#fff;padding:12px 16px;"
+                f"border-radius:8px;margin-bottom:8px'>"
+                f"⏳ <b>Processando em background</b> &nbsp;|&nbsp; "
+                f"Tempo: <b>{elapsed_str}</b> &nbsp;|&nbsp; "
+                f"Atualiza em 3s</div>",
+                unsafe_allow_html=True
+            )
+
+            # Progress bar
+            bar_label = f"{pct}% — {msg}"
+            st.progress(pct / 100, text=bar_label)
+
+            # Live log
+            if logs:
+                log_text = "\n".join(logs[-8:])
+                st.markdown("**📋 Log em tempo real:**")
+                st.code(log_text, language=None)
+            else:
+                st.caption("Aguardando primeira atualização do processo...")
+
+            # Cancel button
             col_cancel, col_space = st.columns([1, 3])
             with col_cancel:
-                if st.button("🛑 Cancelar processamento", key="btn_cancel_pipe"):
+                if st.button("🛑 Cancelar", key="btn_cancel_pipe"):
                     task["cancelled"] = True
                     st.session_state.pop("_citar_task_id", None)
                     st.warning("Processamento cancelado.")
@@ -2527,14 +2562,17 @@ def render_citar_tab():
         # ── Launch background thread ──────────────────────────────────────
         import uuid as _uuid2
         task_id = str(_uuid2.uuid4())[:8]
+        import time as _time_init
         _PIPELINE_TASKS[task_id] = {
-            "status":   "running",
-            "progress": 0,
-            "msg":      "Iniciando...",
-            "result":   None,
-            "error":    None,
-            "traceback": None,
-            "cancelled": False,
+            "status":     "running",
+            "progress":   0,
+            "msg":        "Iniciando...",
+            "logs":       [],
+            "started_at": _time_init.time(),
+            "result":     None,
+            "error":      None,
+            "traceback":  None,
+            "cancelled":  False,
             "citation_style": citation_style,
             "mode": mode_key,
         }
