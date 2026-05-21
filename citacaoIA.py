@@ -1307,10 +1307,31 @@ def chunk_text(text: str, max_chars: int = CHUNK_CHAR_LIMIT) -> list:
 # =============================================================================
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extract text from PDF preserving paragraph structure.
+    Uses block-mode to reconstruct full paragraphs instead of raw line breaks."""
     try:
         import fitz
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        return "\n".join(page.get_text() for page in doc).strip()
+        doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        all_blocks = []
+        for page in doc:
+            for b in page.get_text("blocks"):
+                if b[6] != 0:          # skip image blocks
+                    continue
+                txt = b[4].strip()
+                if not txt or len(txt) < 5:
+                    continue
+                # Rejoin words hyphenated across lines: "psiqui-\natria" → "psiquiatria"
+                txt = re.sub(r'-\n\s*', '', txt)
+                # Rejoin soft line breaks (mid-sentence: lowercase continues on next line)
+                txt = re.sub(
+                    r'(?<![.!?:»\"”])\n(?=[a-záàãâéêíóôõúüça-zA-Z(])',
+                    ' ', txt
+                )
+                # Collapse internal whitespace
+                txt = re.sub(r'[ \t]+', ' ', txt).strip()
+                if txt:
+                    all_blocks.append(txt)
+        return "\n\n".join(all_blocks).strip()
     except Exception as e:
         st.error(f"Erro ao ler PDF: {e}")
         return ""
@@ -1486,6 +1507,102 @@ def _renumber_citations(paragraphs: list, refs: list) -> tuple:
             ordered_refs.append(refs[idx])
 
     return updated, ordered_refs, refx_to_num
+
+
+def _insert_citations_simple(client, provider, model, text: str, refs: list,
+                              mode: str, citation_style: str,
+                              write_fn=None, upd_fn=None) -> dict:
+    """
+    Reliable citation insertion: asks the AI to return annotated TEXT directly
+    (no JSON parsing needed).  Returns:
+      {"full_cited_text": str, "final_refs": list, "ref_map": dict}
+    """
+    import re as _re
+
+    if not refs:
+        return {"full_cited_text": text, "final_refs": [], "ref_map": {}}
+
+    ref_catalogue = _build_ref_catalogue(refs)
+    chunk_limit   = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
+    chunks        = chunk_text(text, max_chars=chunk_limit)
+    cited_chunks  = []
+
+    for i, chunk in enumerate(chunks):
+        if write_fn:
+            write_fn(f"  ✍️ Parte {i+1}/{len(chunks)} — inserindo citações...")
+        if upd_fn:
+            upd_fn(65 + int(20*(i+1)/len(chunks)),
+                   f"Inserindo citações: parte {i+1}/{len(chunks)}")
+
+        if mode == "add":
+            task_desc = (
+                "Add citation tags at the END of each paragraph that contains "
+                "a factual or scientific claim. Do NOT cite headings/titles."
+            )
+        else:
+            task_desc = (
+                "Review existing citation tags and replace them with the correct "
+                "[REFx] tags from the catalogue. Remove invented numbers."
+            )
+
+        prompt = (
+            "You are a scientific citation specialist.\n\n"
+            f"TASK: {task_desc}\n\n"
+            "RULES:\n"
+            "1. Use ONLY the tags listed in the catalogue: [REF1], [REF2], [REF3], etc.\n"
+            "2. Place the tag at the very END of the paragraph (after the last word/period).\n"
+            "3. Do NOT change any word of the original text — only INSERT [REFx] tags.\n"
+            "4. If multiple references support the same claim: [REF1, REF2].\n"
+            "5. If no reference fits: use [?].\n"
+            "6. Headings and section titles: leave unchanged, no tags.\n"
+            "7. Return ONLY the modified text — no JSON, no markdown, no explanations.\n\n"
+            "=== REFERENCE CATALOGUE ===\n"
+            f"{ref_catalogue}\n\n"
+            f"=== TEXT (part {i+1}/{len(chunks)}) ===\n"
+            f"{chunk}\n\n"
+            "Return the modified text only:"
+        )
+
+        cited = ai_call(client, provider, model, prompt, max_tokens=8000)
+        # Strip any accidental markdown fences
+        cited = _re.sub(r'```[^\n]*\n?', '', cited).strip()
+        cited_chunks.append(cited)
+
+    full_cited = "\n\n".join(cited_chunks)
+
+    # ── Renumber [REFx] → [1], [2], ... in order of first appearance ─────
+    ref_order  = {}  # "REF3" -> 1
+    counter    = [0]
+    valid_keys = {f"REF{i}" for i in range(1, len(refs)+1)}
+
+    def _replace(m):
+        inner = m.group(1).strip()
+        if inner == "?":
+            return "[?]"
+        parts = [x.strip() for x in _re.split(r'[,;\s]+', inner)]
+        nums  = []
+        for part in parts:
+            if part in valid_keys:
+                if part not in ref_order:
+                    counter[0] += 1
+                    ref_order[part] = counter[0]
+                nums.append(str(ref_order[part]))
+        return ("[" + ", ".join(nums) + "]") if nums else "[?]"
+
+    full_cited = _re.sub(r'\[([^\]]+)\]', _replace, full_cited)
+
+    # ── Build ordered final reference list ───────────────────────────────
+    final_refs = []
+    for refx, _ in sorted(ref_order.items(), key=lambda x: x[1]):
+        idx = int(refx.replace("REF", "")) - 1
+        if 0 <= idx < len(refs):
+            final_refs.append(refs[idx])
+
+    return {
+        "full_cited_text": full_cited,
+        "final_refs":      final_refs,
+        "ref_map":         ref_order,
+    }
 
 
 def insert_citations_ai(client, provider, model, text, refs, mode, citation_style="Vancouver") -> dict:
@@ -1842,85 +1959,75 @@ def display_results(result, all_refs, final_ref_list, mode):
         return
 
     st.success("Processamento concluido com sucesso!")
-    paragraphs = result.get("paragraphs", [])
-    changed    = [p for p in paragraphs if p.get("changed")]
+    cstyle_disp = st.session_state.get("last_citation_style", "Vancouver")
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Paragrafos analisados", len(paragraphs))
-    c2.metric("Paragrafos alterados",  len(changed))
-    c3.metric("Referencias encontradas", len(all_refs))
-    c4.metric("Referencias no texto",  len(final_ref_list))
+    # ── Determine output mode ─────────────────────────────────────────────
+    simple_mode = result.get("_simple_mode", False)
+    paragraphs  = result.get("paragraphs", [])
+
+    # Metrics
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Referências encontradas", len(all_refs))
+    c2.metric("Referências no texto",    len(final_ref_list))
+    if not simple_mode:
+        c3.metric("Parágrafos alterados", len([p for p in paragraphs if p.get("changed")]))
+    else:
+        import re as _re_disp
+        n_cit = len(_re_disp.findall(r'\[\d', result.get("full_cited_text", "")))
+        c3.metric("Citações inseridas", n_cit)
     st.divider()
 
-    if result.get("summary"):
-        st.info(f"Resumo: {result['summary']}")
-    if result.get("changes_detail"):
-        with st.expander("Log detalhado de alteracoes"):
-            for line in result["changes_detail"]:
-                st.markdown(f"- {line}")
-    st.divider()
+    # ── Build full output text ────────────────────────────────────────────
+    if simple_mode:
+        body = result.get("full_cited_text", "")
+    else:
+        body = "\n\n".join(p.get("modified") or p.get("original", "") for p in paragraphs)
 
-    tab_final, tab_compare, tab_refs = st.tabs(
-        ["Texto Final com Citacoes", "Comparacao Paragrafo a Paragrafo", "Lista de Referencias"])
+    ref_section = "\n\n" + "─" * 60 + f"\nREFERÊNCIAS ({cstyle_disp})\n" + "─" * 60 + "\n"
+    if final_ref_list:
+        ref_section += "\n".join(
+            format_reference(r, i, cstyle_disp)
+            for i, r in enumerate(final_ref_list, 1)
+        )
+    else:
+        ref_section += "(referências não resolvidas)"
+
+    full = body + "\n\n" + ref_section
+
+    # ── Tabs ─────────────────────────────────────────────────────────────
+    tab_final, tab_refs = st.tabs(["📄 Texto Final com Citações", "📚 Lista de Referências"])
 
     with tab_final:
-        body = "\n\n".join(p.get("modified") or p.get("original","") for p in paragraphs)
-        cstyle_disp = st.session_state.get("last_citation_style","Vancouver")
-        ref_lines = ["\n\n" + "-"*60, f"REFERENCIAS ({cstyle_disp})", "-"*60]
-        if final_ref_list:
-            for i,r in enumerate(final_ref_list,1): ref_lines.append(format_reference(r,i,cstyle_disp))
-        else:
-            ref_lines.append("(referencias nao resolvidas)")
-        full = body + "\n".join(ref_lines)
-        st.text_area("", value=full, height=500, label_visibility="collapsed")
+        st.text_area("", value=full, height=560, label_visibility="collapsed")
 
-        # Always show TXT download first
-        txt_fname = "texto_citado.txt"
-        docx_fname = "texto_citado.docx"
         col_dl1, col_dl2 = st.columns(2)
         with col_dl1:
             st.download_button(
                 "📥 Baixar (.txt)",
                 data=full.encode("utf-8"),
-                file_name=txt_fname,
+                file_name="texto_citado.txt",
                 mime="text/plain",
                 use_container_width=True,
             )
         with col_dl2:
             try:
-                cstyle_dl = st.session_state.get("last_citation_style","Vancouver")
-                docx_bytes = generate_docx(paragraphs, final_ref_list, mode, cstyle_dl)
+                # For simple_mode build fake paragraphs list for generate_docx
+                if simple_mode:
+                    _paras_docx = [{"modified": p, "changed": True}
+                                   for p in body.split("\n\n") if p.strip()]
+                else:
+                    _paras_docx = paragraphs
+                docx_bytes_dl = generate_docx(_paras_docx, final_ref_list, mode, cstyle_disp)
                 st.download_button(
                     "📄 Baixar Word (.docx)",
-                    data=docx_bytes,
-                    file_name=docx_fname,
+                    data=docx_bytes_dl,
+                    file_name="texto_citado.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True,
                     type="primary",
                 )
             except Exception as e_docx:
-                st.warning(f"Word nao gerado ({e_docx}) — use o .txt acima")
-
-    with tab_compare:
-        if not paragraphs:
-            st.info("Nenhum paragrafo encontrado.")
-        else:
-            for i,p in enumerate(paragraphs):
-                is_ch = p.get("changed",False)
-                pill  = '<span class="pill-changed">Alterado</span>' if is_ch else '<span class="pill-ok">Sem alteracao</span>'
-                with st.expander(f"Paragrafo {i+1}  {pill}", expanded=is_ch):
-                    if is_ch:
-                        ca,cb = st.columns(2)
-                        with ca:
-                            st.markdown("**Original:**")
-                            st.markdown(f"<div style='background:#fff3cd;padding:.7rem;border-radius:6px'>{p.get('original','')}</div>", unsafe_allow_html=True)
-                        with cb:
-                            st.markdown("**Com citacoes:**")
-                            st.markdown(f"<div style='background:#d4edda;padding:.7rem;border-radius:6px'>{p.get('modified','')}</div>", unsafe_allow_html=True)
-                        if p.get("changes"):
-                            st.caption(" | ".join(p["changes"]))
-                    else:
-                        st.markdown(p.get("original",""))
+                st.warning(f"Word não gerado ({e_docx}) — use o .txt acima")
 
     with tab_refs:
         disp = final_ref_list if final_ref_list else all_refs
@@ -2338,35 +2445,31 @@ def _run_pipeline_sync(write_fn, upd_fn,
              f"({len(ref_metadata)} locais/manuais + {len(unique_web)} da web)")
     upd_fn(62, f"{len(all_refs)} refs encontradas — inserindo citações...")
 
-    # 5. Insert citations
-    write_fn("✍️ Inserindo citações com IA (pode levar alguns minutos)...")
-    upd_fn(65, "Inserindo citações...")
+    # 5. Insert citations — plain-text approach (no fragile JSON)
+    write_fn(f"✍️ Inserindo citações em {len(chunk_text(main_text, max_chars=chunk_limit))} parte(s) do texto...")
+    upd_fn(65, "Inserindo citações com IA...")
     try:
-        result = insert_citations_ai_bg(client, provider, model, main_text,
-                                        all_refs, mode, citation_style,
-                                        upd_fn=lambda p, m: upd_fn(65 + int(p * 0.25), m))
+        cit_result = _insert_citations_simple(
+            client, provider, model, main_text, all_refs, mode, citation_style,
+            write_fn=write_fn, upd_fn=upd_fn
+        )
     except Exception as e_ins:
-        write_fn(f"⚠️ Erro ao inserir citações: {e_ins} — retornando resultado parcial")
-        result = {"error": str(e_ins), "paragraphs": [], "reference_map": {}}
+        write_fn(f"⚠️ Erro ao inserir citações: {e_ins}")
+        cit_result = {"full_cited_text": main_text, "final_refs": [], "ref_map": {}}
 
-    upd_fn(90, "Montando lista de referências...")
-    write_fn("📋 Montando lista final de referências...")
-
-    final_ref_list = result.get("_final_refs", [])
-    if not final_ref_list:
-        ref_map  = result.get("reference_map", {})
-        seen_idx = []
-        for num_str, ref_id in sorted(ref_map.items(),
-                                      key=lambda x: int(x[0]) if x[0].isdigit() else 999):
-            idx_str = _re.sub(r"[^0-9]", "", str(ref_id))
-            if idx_str:
-                idx = int(idx_str) - 1
-                if 0 <= idx < len(all_refs) and idx not in seen_idx:
-                    seen_idx.append(idx)
-                    final_ref_list.append(all_refs[idx])
-
+    upd_fn(97, "Finalizando...")
+    final_ref_list = cit_result.get("final_refs", [])
+    write_fn(f"🎉 **Pronto!** {len(final_ref_list)} referência(s) inserida(s) no texto.")
     upd_fn(100, "Concluído!")
-    write_fn(f"🎉 **Pronto!** {len(final_ref_list)} referência(s) inserida(s).")
+
+    # Package result in format display_results expects
+    result = {
+        "full_cited_text": cit_result.get("full_cited_text", main_text),
+        "final_refs":      final_ref_list,
+        "ref_map":         cit_result.get("ref_map", {}),
+        "paragraphs":      [],   # empty — display_results will use full_cited_text
+        "_simple_mode":    True,
+    }
     return result, all_refs, final_ref_list
 
 
