@@ -2229,155 +2229,168 @@ def parse_manual_refs(text: str) -> list:
     return refs
 
 
+def _run_pipeline_sync(write_fn, upd_fn,
+                       provider: str, client_cfg: dict,
+                       main_text: str, ref_bytes: list,
+                       mode: str, library_refs: list,
+                       citation_style: str, manual_refs: list):
+    """Synchronous pipeline — called from inside st.status() context.
+    write_fn : callable(str) — appends a visible log line (st.write)
+    upd_fn   : callable(pct, msg) — updates the status label
+    Returns  : (result, all_refs, final_ref_list)
+    """
+    import re as _re, json as _json, time as _time, traceback as _tb
+
+    from anthropic import Anthropic
+    from openai import OpenAI
+    import google.genai as genai
+
+    api_key = client_cfg["api_key"]
+    model   = client_cfg["model"]
+
+    upd_fn(2, "Conectando ao provedor de IA...")
+    write_fn(f"🔌 Conectando ao provedor **{provider}**...")
+    if provider == "Anthropic (Claude)":
+        client = Anthropic(api_key=api_key)
+    elif provider == "OpenAI":
+        client = OpenAI(api_key=api_key)
+    else:
+        client = genai.Client(api_key=api_key)
+    write_fn(f"✅ Conectado. Texto recebido: **{len(main_text):,}** caracteres.")
+
+    # 1. Extract PDF metadata
+    ref_metadata = list(library_refs)
+    ref_metadata.extend(manual_refs)
+    if ref_bytes:
+        write_fn(f"📄 Analisando **{len(ref_bytes)}** PDF(s) de referência...")
+        upd_fn(5, f"Analisando {len(ref_bytes)} PDF(s)...")
+        for i, (fname, fbytes) in enumerate(ref_bytes):
+            pdf_text = extract_text_from_pdf(fbytes)
+            meta     = extract_ref_metadata_ai(client, provider, model, pdf_text, fname)
+            ref_metadata.append(meta)
+            write_fn(f"  ✔ `{fname}` → {meta.get('title','sem título')[:60]}")
+            upd_fn(5 + int(15*(i+1)/len(ref_bytes)),
+                   f"PDF {i+1}/{len(ref_bytes)}: {meta.get('title','')[:40]}...")
+
+    # 2. Chunk text
+    chunk_limit = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
+    text_chunks = chunk_text(main_text, max_chars=chunk_limit)
+    MAX_ID_CHUNKS = 15
+    id_chunks = text_chunks[:MAX_ID_CHUNKS]
+    n_id      = len(id_chunks)
+    write_fn(f"✂️ Texto dividido em **{len(text_chunks)}** parte(s) — analisando {n_id}...")
+    upd_fn(20, f"Identificando necessidades ({n_id} partes)...")
+
+    all_queries = []
+    for ci, chunk in enumerate(id_chunks):
+        upd_fn(20 + int(10*(ci+1)/n_id),
+               f"Parte {ci+1}/{n_id} — {len(all_queries)} queries até agora")
+        needs_data = identify_citation_needs(client, provider, model, chunk, mode)
+        for p in needs_data.get("paragraphs", []):
+            all_queries.extend(p.get("pubmed_queries", []))
+        write_fn(f"  🔍 Parte {ci+1}/{n_id}: +{len(needs_data.get('paragraphs',[]))} parágrafos, "
+                 f"{len(all_queries)} queries acumuladas")
+
+    all_queries = list(dict.fromkeys(q for q in all_queries if q.strip()))
+    MAX_SEARCHES = 25
+    all_queries  = all_queries[:MAX_SEARCHES]
+
+    # 3. Fallback queries
+    if not all_queries:
+        write_fn("⚠️ Sem queries específicas — gerando a partir do tópico do texto...")
+        upd_fn(30, "Gerando queries de fallback...")
+        topic_prompt = (
+            "Read this scientific text and generate 6 specific PubMed search queries in English. "
+            "Return ONLY a JSON array of strings.\n\nTEXT:\n" + main_text[:1500]
+        )
+        raw_q = ai_call(client, provider, model, topic_prompt, max_tokens=500)
+        try:
+            m = _re.search(r"\[.*\]", raw_q, _re.DOTALL)
+            if m:
+                all_queries = _json.loads(m.group())[:8]
+        except Exception:
+            pass
+        write_fn(f"  ↳ {len(all_queries)} queries geradas automaticamente")
+
+    # 4. Multi-source search
+    web_refs = []
+    if all_queries:
+        write_fn(f"🌐 Buscando **{len(all_queries)}** queries em PubMed · LILACS · OpenAlex · Europe PMC...")
+        for i, q in enumerate(all_queries):
+            pct = 35 + int(25*(i+1)/len(all_queries))
+            upd_fn(pct, f"Busca {i+1}/{len(all_queries)}: {q[:50]}...")
+            results = multi_source_search(q, max_per_source=2)
+            web_refs.extend(results)
+            write_fn(f"  [{i+1:02d}/{len(all_queries)}] `{q[:55]}` → {len(results)} resultado(s)")
+            _time.sleep(0.25)
+        for q in all_queries[:4]:
+            web_refs.extend(search_europe_pmc(q, max_results=2, source_filter="PPR"))
+
+    seen, unique_web = set(), []
+    for r in web_refs:
+        t = r.get("title", "").lower()[:80]
+        if t not in seen:
+            seen.add(t)
+            unique_web.append(r)
+
+    all_refs = ref_metadata + unique_web
+    write_fn(f"📚 **{len(all_refs)}** referências no total "
+             f"({len(ref_metadata)} locais/manuais + {len(unique_web)} da web)")
+    upd_fn(62, f"{len(all_refs)} refs encontradas — inserindo citações...")
+
+    # 5. Insert citations
+    write_fn("✍️ Inserindo citações com IA (pode levar alguns minutos)...")
+    upd_fn(65, "Inserindo citações...")
+    try:
+        result = insert_citations_ai_bg(client, provider, model, main_text,
+                                        all_refs, mode, citation_style,
+                                        upd_fn=lambda p, m: upd_fn(65 + int(p * 0.25), m))
+    except Exception as e_ins:
+        write_fn(f"⚠️ Erro ao inserir citações: {e_ins} — retornando resultado parcial")
+        result = {"error": str(e_ins), "paragraphs": [], "reference_map": {}}
+
+    upd_fn(90, "Montando lista de referências...")
+    write_fn("📋 Montando lista final de referências...")
+
+    final_ref_list = result.get("_final_refs", [])
+    if not final_ref_list:
+        ref_map  = result.get("reference_map", {})
+        seen_idx = []
+        for num_str, ref_id in sorted(ref_map.items(),
+                                      key=lambda x: int(x[0]) if x[0].isdigit() else 999):
+            idx_str = _re.sub(r"[^0-9]", "", str(ref_id))
+            if idx_str:
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(all_refs) and idx not in seen_idx:
+                    seen_idx.append(idx)
+                    final_ref_list.append(all_refs[idx])
+
+    upd_fn(100, "Concluído!")
+    write_fn(f"🎉 **Pronto!** {len(final_ref_list)} referência(s) inserida(s).")
+    return result, all_refs, final_ref_list
+
+
 def _pipeline_worker(task_id: str, provider: str, client_cfg: dict,
                      main_text: str, ref_bytes: list,
                      mode: str, library_refs: list,
                      citation_style: str, manual_refs: list):
-    """Background thread: runs pipeline without any st.* calls."""
-    import re as _re, json as _json, time as _time, traceback as _tb
-    task = _PIPELINE_TASKS[task_id]
-
-    def upd(pct, msg):
-        import time as _t_upd
+    """Backward-compat wrapper kept for reference (no longer used in UI)."""
+    task = _PIPELINE_TASKS.get(task_id, {})
+    def _w(msg): pass
+    def _u(pct, msg):
         task["progress"] = int(pct)
         task["msg"]      = msg
-        elapsed = _t_upd.time() - task.get("started_at", _t_upd.time())
-        mins, secs = divmod(int(elapsed), 60)
-        ts = f"{mins:02d}:{secs:02d}"
-        entry = f"[{ts}] {int(pct):3d}% — {msg}"
-        logs = task.setdefault("logs", [])
-        logs.append(entry)
-        if len(logs) > 30:
-            logs.pop(0)
-
     try:
-        upd(1, "Thread iniciada — carregando bibliotecas...")
-
-        # Rebuild AI client inside thread (can't pickle Streamlit UploadedFile)
-        upd(2, "Importando bibliotecas de IA...")
-        from anthropic import Anthropic
-        from openai import OpenAI
-        import google.genai as genai
-
-        api_key  = client_cfg["api_key"]
-        model    = client_cfg["model"]
-
-        upd(4, f"Conectando ao provedor {provider}...")
-        if provider == "Anthropic (Claude)":
-            client = Anthropic(api_key=api_key)
-        elif provider == "OpenAI":
-            client = OpenAI(api_key=api_key)
-        else:
-            client = genai.Client(api_key=api_key)
-
-        upd(5, f"Conectado. Preparando texto ({len(main_text):,} caracteres)...")
-
-        # 1. Extract PDF metadata
-        ref_metadata = list(library_refs)
-        ref_metadata.extend(manual_refs)
-        if ref_bytes:
-            upd(5, f"Analisando {len(ref_bytes)} artigo(s) de referencia...")
-            for i, (fname, fbytes) in enumerate(ref_bytes):
-                pdf_text = extract_text_from_pdf(fbytes)
-                meta     = extract_ref_metadata_ai(client, provider, model, pdf_text, fname)
-                ref_metadata.append(meta)
-                upd(5 + int(15*(i+1)/len(ref_bytes)),
-                    f"Artigo {i+1}/{len(ref_bytes)}: {meta.get('title','')[:50]}...")
-
-        # 2. Chunk text — cap at 15 chunks for the identify phase to avoid timeouts
-        chunk_limit = CHUNK_CHAR_LIMIT_GEMINI if "Gemini" in provider else CHUNK_CHAR_LIMIT
-        text_chunks = chunk_text(main_text, max_chars=chunk_limit)
-        MAX_ID_CHUNKS = 15
-        id_chunks   = text_chunks[:MAX_ID_CHUNKS]
-        n_id        = len(id_chunks)
-        upd(20, f"Identificando necessidades em {n_id} parte(s) (de {len(text_chunks)} total)...")
-
-        all_queries = []
-        for ci, chunk in enumerate(id_chunks):
-            if task.get("cancelled"):
-                task["status"] = "cancelled"
-                return
-            needs_data = identify_citation_needs(client, provider, model, chunk, mode)
-            for p in needs_data.get("paragraphs", []):
-                all_queries.extend(p.get("pubmed_queries", []))
-            upd(20 + int(10*(ci+1)/n_id),
-                f"Analise parte {ci+1}/{n_id}: {len(all_queries)} queries geradas")
-
-        all_queries = list(dict.fromkeys(q for q in all_queries if q.strip()))
-        MAX_SEARCHES = 25
-        all_queries  = all_queries[:MAX_SEARCHES]
-
-        # 3. Fallback queries
-        if not all_queries:
-            upd(30, "Gerando queries a partir do topico do texto...")
-            topic_prompt = (
-                "Read this scientific text and generate 6 specific PubMed search queries in English. "
-                "Return ONLY a JSON array of strings.\n\nTEXT:\n" + main_text[:1500]
-            )
-            raw_q = ai_call(client, provider, model, topic_prompt, max_tokens=500)
-            try:
-                m = _re.search(r"\[.*\]", raw_q, _re.DOTALL)
-                if m:
-                    all_queries = _json.loads(m.group())[:8]
-            except Exception:
-                pass
-
-        # 4. Multi-source search
-        web_refs = []
-        if all_queries:
-            upd(35, f"Buscando em {len(all_queries)} queries x 4 bases...")
-            for i, q in enumerate(all_queries):
-                if task.get("cancelled"):
-                    task["status"] = "cancelled"
-                    return
-                pct = 35 + int(25*(i+1)/len(all_queries))
-                upd(pct, f"Busca {i+1}/{len(all_queries)}: {q[:55]}")
-                web_refs.extend(multi_source_search(q, max_per_source=2))
-                _time.sleep(0.25)
-            for q in all_queries[:4]:
-                web_refs.extend(search_europe_pmc(q, max_results=2, source_filter="PPR"))
-
-        seen, unique_web = set(), []
-        for r in web_refs:
-            t = r.get("title", "").lower()[:80]
-            if t not in seen:
-                seen.add(t)
-                unique_web.append(r)
-
-        all_refs = ref_metadata + unique_web
-        upd(62, f"Total: {len(all_refs)} refs ({len(ref_metadata)} locais/manuais + {len(unique_web)} web)")
-
-        # 5. Insert citations (over ALL original chunks, not just id_chunks)
-        upd(65, "Inserindo citacoes com IA...")
-        try:
-            result = insert_citations_ai_bg(client, provider, model, main_text,
-                                            all_refs, mode, citation_style, upd_fn=upd)
-        except Exception as e_ins:
-            result = {"error": str(e_ins), "paragraphs": [], "reference_map": {}}
-
-        upd(90, "Montando resultado final...")
-
-        final_ref_list = result.get("_final_refs", [])
-        if not final_ref_list:
-            ref_map = result.get("reference_map", {})
-            seen_idx = []
-            for num_str, ref_id in sorted(ref_map.items(),
-                                          key=lambda x: int(x[0]) if x[0].isdigit() else 999):
-                idx_str = _re.sub(r"[^0-9]", "", str(ref_id))
-                if idx_str:
-                    idx = int(idx_str) - 1
-                    if 0 <= idx < len(all_refs) and idx not in seen_idx:
-                        seen_idx.append(idx)
-                        final_ref_list.append(all_refs[idx])
-
-        upd(100, "Concluido!")
-        task["result"]  = (result, all_refs, final_ref_list)
-        task["status"]  = "done"
-
+        result, all_refs, final_ref_list = _run_pipeline_sync(
+            _w, _u, provider, client_cfg, main_text, ref_bytes,
+            mode, library_refs, citation_style, manual_refs)
+        task["result"] = (result, all_refs, final_ref_list)
+        task["status"] = "done"
     except Exception as e:
-        task["error"]    = str(e)
+        import traceback as _tb
+        task["error"]     = str(e)
         task["traceback"] = _tb.format_exc()
-        task["status"]   = "error"
+        task["status"]    = "error"
 
 def render_citar_tab():
     st.markdown("### Processar Texto")
@@ -2390,86 +2403,7 @@ def render_citar_tab():
         st.warning("Configure a chave API na barra lateral antes de processar.")
         return
 
-    # ── Check if a background task is running ────────────────────────────
-    task_id = st.session_state.get("_citar_task_id")
-    if task_id and task_id in _PIPELINE_TASKS:
-        task = _PIPELINE_TASKS[task_id]
-        status = task.get("status", "running")
-
-        if status == "running":
-            import time as _t_disp
-            pct      = task.get("progress", 0)
-            msg      = task.get("msg", "Processando...")
-            logs     = task.get("logs", [])
-            started  = task.get("started_at", _t_disp.time())
-            elapsed  = _t_disp.time() - started
-            mins, secs = divmod(int(elapsed), 60)
-            elapsed_str = f"{mins:02d}:{secs:02d}"
-
-            # Header
-            st.markdown(
-                f"<div style='background:#1e3a5f;color:#fff;padding:12px 16px;"
-                f"border-radius:8px;margin-bottom:8px'>"
-                f"⏳ <b>Processando em background</b> &nbsp;|&nbsp; "
-                f"Tempo: <b>{elapsed_str}</b> &nbsp;|&nbsp; "
-                f"Atualiza em 3s</div>",
-                unsafe_allow_html=True
-            )
-
-            # Progress bar
-            bar_label = f"{pct}% — {msg}"
-            st.progress(pct / 100, text=bar_label)
-
-            # Live log
-            if logs:
-                log_text = "\n".join(logs[-8:])
-                st.markdown("**📋 Log em tempo real:**")
-                st.code(log_text, language=None)
-            else:
-                st.caption("Aguardando primeira atualização do processo...")
-
-            # Cancel button
-            col_cancel, col_space = st.columns([1, 3])
-            with col_cancel:
-                if st.button("🛑 Cancelar", key="btn_cancel_pipe"):
-                    task["cancelled"] = True
-                    st.session_state.pop("_citar_task_id", None)
-                    st.warning("Processamento cancelado.")
-                    st.rerun()
-
-            # Auto-refresh every 3 seconds while running
-            time.sleep(3)
-            st.rerun()
-            return
-
-        elif status == "done":
-            result, all_refs, final_ref_list = task["result"]
-            st.session_state["last_citation_style"] = task.get("citation_style", "Vancouver")
-            st.session_state["last_result"]          = result
-            st.session_state["last_all_refs"]         = all_refs
-            st.session_state["last_final_refs"]       = final_ref_list
-            st.session_state["last_mode"]             = task.get("mode", "add")
-            st.session_state.pop("_citar_task_id", None)
-            del _PIPELINE_TASKS[task_id]
-            st.success("✅ Processamento concluído com sucesso!")
-            st.rerun()
-            return
-
-        elif status == "error":
-            err = task.get("error", "Erro desconhecido")
-            tb  = task.get("traceback", "")
-            st.session_state.pop("_citar_task_id", None)
-            del _PIPELINE_TASKS[task_id]
-            st.error(f"❌ **Erro no processamento:** {err}")
-            if tb:
-                with st.expander("📋 Detalhes técnicos do erro"):
-                    st.code(tb)
-            st.info("💡 Tente novamente. Se o erro persistir, reduza o tamanho do texto ou mude o modelo para claude-haiku.")
-
-        elif status == "cancelled":
-            st.session_state.pop("_citar_task_id", None)
-            if task_id in _PIPELINE_TASKS:
-                del _PIPELINE_TASKS[task_id]
+    # (background task polling removed — now uses st.status() synchronous approach)
 
     # ── Config UI ─────────────────────────────────────────────────────────
     col_mode, col_style = st.columns([2, 1])
@@ -2563,38 +2497,46 @@ def render_citar_tab():
         extra_refs       = parse_manual_refs(manual_ref_text) if manual_ref_text.strip() else []
         combined_library = extra_refs + library_refs
 
-        # ── Launch background thread ──────────────────────────────────────
-        import uuid as _uuid2
-        task_id = str(_uuid2.uuid4())[:8]
-        import time as _time_init
-        _PIPELINE_TASKS[task_id] = {
-            "status":     "running",
-            "progress":   0,
-            "msg":        "Iniciando...",
-            "logs":       [],
-            "started_at": _time_init.time(),
-            "result":     None,
-            "error":      None,
-            "traceback":  None,
-            "cancelled":  False,
-            "citation_style": citation_style,
-            "mode": mode_key,
-        }
-        st.session_state["_citar_task_id"] = task_id
+        # ── Run pipeline with st.status() — real-time progress ───────────
+        import traceback as _tb_citar
+        _status_placeholder = st.empty()
 
-        t = _threading.Thread(
-            target=_pipeline_worker,
-            args=(task_id, provider,
-                  {"api_key": api_key, "model": model},
-                  main_text, ref_bytes,
-                  mode_key, combined_library,
-                  citation_style, extra_refs),
-            daemon=True,
-        )
-        t.start()
-        st.info("⏳ Processamento iniciado em background. A página atualiza automaticamente.")
-        time.sleep(1)
-        st.rerun()
+        with st.status("⏳ Processando texto com IA...", expanded=True) as _status_ui:
+            try:
+                result, all_refs, final_ref_list = _run_pipeline_sync(
+                    write_fn = st.write,
+                    upd_fn   = lambda pct, msg: _status_ui.update(
+                                    label=f"{pct}% — {msg}"),
+                    provider     = provider,
+                    client_cfg   = {"api_key": api_key, "model": model},
+                    main_text    = main_text,
+                    ref_bytes    = ref_bytes,
+                    mode         = mode_key,
+                    library_refs = combined_library,
+                    citation_style = citation_style,
+                    manual_refs  = extra_refs,
+                )
+                _status_ui.update(
+                    label="✅ Processamento concluído!",
+                    state="complete",
+                    expanded=False,
+                )
+                st.session_state["last_citation_style"] = citation_style
+                st.session_state["last_result"]         = result
+                st.session_state["last_all_refs"]       = all_refs
+                st.session_state["last_final_refs"]     = final_ref_list
+                st.session_state["last_mode"]           = mode_key
+
+            except Exception as _e_pipe:
+                _status_ui.update(
+                    label=f"❌ Erro: {str(_e_pipe)[:80]}",
+                    state="error",
+                    expanded=True,
+                )
+                st.error(f"**Erro no processamento:** {_e_pipe}")
+                with st.expander("📋 Detalhes técnicos"):
+                    st.code(_tb_citar.format_exc())
+                st.info("💡 Tente novamente. Se persistir, reduza o texto ou mude para claude-haiku.")
 
     # ── Display previous results ──────────────────────────────────────────
     _lr = st.session_state.get("last_result")
