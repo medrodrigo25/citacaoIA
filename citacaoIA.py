@@ -1153,12 +1153,31 @@ def ai_call(client, provider: str, model: str, prompt: str, max_tokens: int = 80
     Implements exponential backoff: waits 15s, 30s, 60s between retries."""
     import time as _time
 
-    # Limit prompt size to avoid hitting 50k input token/min rate limit
-    # ~4 chars per token → 50k tokens ≈ 200k chars; stay under 40k tokens = 160k chars
-    MAX_PROMPT_CHARS = 12000  # conservative per-call limit
+    # Limit prompt size to avoid hitting token rate limits.
+    # Strategy: if prompt is too long, truncate the CATALOGUE section (between
+    # === REFERENCE CATALOGUE === and === TEXT ===), not the text chunk itself.
+    MAX_PROMPT_CHARS = 28000  # ~7k tokens, well within per-minute limits
     if len(prompt) > MAX_PROMPT_CHARS:
-        # Truncate the text block inside the prompt, keeping instructions intact
-        prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[TEXTO TRUNCADO PARA LIMITE DE TOKENS]"
+        import re as _re_trunc
+        # Try to find and shorten the catalogue block
+        cat_match = _re_trunc.search(
+            r'(=== REFERENCE CATALOGUE ===\n)(.*?)(\n=== TEXT)',
+            prompt, _re_trunc.DOTALL
+        )
+        if cat_match:
+            cat_block  = cat_match.group(2)
+            # Keep only as many catalogue lines as fit in the budget
+            budget     = MAX_PROMPT_CHARS - (len(prompt) - len(cat_block)) - 200
+            if budget > 500:
+                # Trim catalogue to budget
+                trimmed    = cat_block[:budget] + "\n...(catalogo truncado)"
+                prompt     = prompt[:cat_match.start(2)] + trimmed + prompt[cat_match.end(2):]
+            else:
+                # Extreme case: drop catalogue entirely, keep text
+                prompt = prompt[:cat_match.start()] + "(catalogo omitido por limite de tokens)" + prompt[cat_match.end():]
+        else:
+            # Fallback: hard truncate
+            prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[PROMPT TRUNCADO]"
 
     max_retries = 3
     wait_times  = [15, 30, 60]
@@ -1394,15 +1413,37 @@ TEXT:
     data = extract_json_from_ai(raw)
     return data if data else {"paragraphs":[]}
 
-def _build_ref_catalogue(refs: list) -> str:
+def _build_ref_catalogue(refs: list, compact: bool = False) -> str:
+    """Build reference catalogue for AI prompt.
+    compact=True  → one line per ref (for large reference lists, saves token space)
+    compact=False → multi-line with abstract snippet (for small lists)
+    """
+    if not refs:
+        return "(nenhuma referencia disponivel -- use [?])"
+
+    # Auto-select compact mode when refs are many
+    if len(refs) > 20:
+        compact = True
+
     cat = ""
     for i, r in enumerate(refs, 1):
-        cat += f"\n[REF{i}] Titulo: {r.get('title','')}\n"
-        cat += f"  Autores: {', '.join(r.get('authors',[]))}\n"
-        cat += f"  Periodico: {r.get('journal','')} {r.get('year','')}\n"
-        if r.get("abstract"):
-            cat += f"  Resumo: {r['abstract'][:200]}\n"
-    return cat or "(nenhuma referencia disponivel -- use [?])"
+        authors = r.get("authors", [])
+        a_str   = authors[0] if authors else ""
+        if len(authors) > 1:
+            a_str += " et al."
+        title   = r.get("title", "")[:80]
+        journal = r.get("journal", "")
+        year    = r.get("year", "")
+        if compact:
+            # Single line: [REF1] Autor et al. Título (80 chars). Journal Year.
+            cat += f"[REF{i}] {a_str}. {title}. {journal} {year}.\n"
+        else:
+            cat += f"\n[REF{i}] {title}\n"
+            cat += f"  Autores: {', '.join(authors)}\n"
+            cat += f"  Periodico: {journal} {year}\n"
+            if r.get("abstract"):
+                cat += f"  Resumo: {r['abstract'][:150]}\n"
+    return cat
 
 
 def _insert_citations_chunk(client, provider, model, chunk_text, ref_catalogue, mode, citation_style="Vancouver") -> dict:
@@ -1535,37 +1576,62 @@ def _insert_citations_simple(client, provider, model, text: str, refs: list,
                    f"Inserindo citações: parte {i+1}/{len(chunks)}")
 
         if mode == "add":
-            task_desc = (
-                "Add citation tags at the END of each paragraph that contains "
-                "a factual or scientific claim. Do NOT cite headings/titles."
+            task_verb = "ADD"
+            task_rule = (
+                "For each paragraph with a scientific/factual claim, "
+                "append the matching [REFx] tag(s) at the very END of that paragraph."
             )
         else:
-            task_desc = (
-                "Review existing citation tags and replace them with the correct "
-                "[REFx] tags from the catalogue. Remove invented numbers."
+            task_verb = "REVIEW"
+            task_rule = (
+                "Check each existing citation tag against the catalogue. "
+                "Replace wrong/missing tags with the correct [REFx]. Remove invented numbers."
             )
 
+        # TEXT FIRST — eliminates any chance the model misses it
         prompt = (
-            "You are a scientific citation specialist.\n\n"
-            f"TASK: {task_desc}\n\n"
-            "RULES:\n"
-            "1. Use ONLY the tags listed in the catalogue: [REF1], [REF2], [REF3], etc.\n"
-            "2. Place the tag at the very END of the paragraph (after the last word/period).\n"
-            "3. Do NOT change any word of the original text — only INSERT [REFx] tags.\n"
-            "4. If multiple references support the same claim: [REF1, REF2].\n"
-            "5. If no reference fits: use [?].\n"
-            "6. Headings and section titles: leave unchanged, no tags.\n"
-            "7. Return ONLY the modified text — no JSON, no markdown, no explanations.\n\n"
+            "You are a scientific citation specialist. "
+            f"Your job: {task_verb} citations in the text below.\n\n"
+            f"=== TEXT TO ANNOTATE (part {i+1}/{len(chunks)}) ===\n"
+            f"{chunk}\n"
+            "=== END OF TEXT ===\n\n"
+            f"INSTRUCTIONS: {task_rule}\n"
+            "RULES (read carefully):\n"
+            "• Use ONLY the [REFx] tags from the CATALOGUE below — e.g. [REF1], [REF2].\n"
+            "• Place the tag at the END of the paragraph, after the last word or period.\n"
+            "• Do NOT change, paraphrase or remove any word of the original text.\n"
+            "• Multiple refs for one claim: [REF1, REF2]. No ref fits: [?].\n"
+            "• Headings and section titles: copy unchanged, NO tag.\n"
+            "• Output ONLY the annotated text — no JSON, no markdown, no commentary.\n\n"
             "=== REFERENCE CATALOGUE ===\n"
-            f"{ref_catalogue}\n\n"
-            f"=== TEXT (part {i+1}/{len(chunks)}) ===\n"
-            f"{chunk}\n\n"
-            "Return the modified text only:"
+            f"{ref_catalogue}\n"
+            "=== END OF CATALOGUE ===\n\n"
+            "Return the annotated text now:"
         )
 
         cited = ai_call(client, provider, model, prompt, max_tokens=8000)
+
+        # ── Sanity check: if AI produced a complaint instead of annotated text ──
+        complaint_phrases = [
+            "text is missing", "not included in your message",
+            "no text was provided", "please provide the text",
+            "actual paragraphs", "I notice that", "I'm ready to add",
+        ]
+        is_complaint = any(ph in cited.lower() for ph in complaint_phrases)
+        if is_complaint or len(cited.strip()) < 30:
+            # Retry with ultra-minimal prompt — just the text + one-line instruction
+            minimal = (
+                f"Add [REF1]..[REF{len(refs)}] citation tags to paragraphs. "
+                f"Use ONLY tags from this catalogue:\n{ref_catalogue[:2000]}\n\n"
+                f"TEXT:\n{chunk}\n\nReturn annotated text only:"
+            )
+            cited = ai_call(client, provider, model, minimal, max_tokens=8000)
+
         # Strip any accidental markdown fences
         cited = _re.sub(r'```[^\n]*\n?', '', cited).strip()
+        # If still a complaint after retry, fall back to original chunk (no citations)
+        if any(ph in cited.lower() for ph in complaint_phrases) or len(cited.strip()) < 10:
+            cited = chunk
         cited_chunks.append(cited)
 
     full_cited = "\n\n".join(cited_chunks)
@@ -3121,76 +3187,444 @@ def display_revision_results(result: dict):
 # REVISION TAB
 # =============================================================================
 
-def render_revisao_tab():
-    st.markdown("### Revisao Editorial do Texto")
-    st.caption(
-        "Revisao ortografica, gramatical, estilistica e de redundancia — "
-        "como um editor senior de publicacoes cientificas.")
+# =============================================================================
+# REVISÃO CIENTÍFICA — helpers
+# =============================================================================
 
-    api_key  = st.session_state.get("_api_key","")
-    provider = st.session_state.get("_provider","")
-    model    = st.session_state.get("_model","")
+def _parse_text_and_refs(full_text: str) -> tuple:
+    """Parse text that contains inline citations [1],[2] and a reference list.
+    Returns (paragraphs: list[dict], references: dict[int, str])
+    """
+    import re as _re
+
+    # ── Detect reference section ──────────────────────────────────────────
+    sep = _re.search(
+        r'\n\s*(?:referências?|references?|bibliografia|bibliography|──+)\s*\n',
+        full_text, _re.IGNORECASE
+    )
+    if sep:
+        body_text = full_text[:sep.start()]
+        ref_text  = full_text[sep.start():]
+    else:
+        # Heuristic: find start of numbered list with ≥3 items
+        m = _re.search(r'\n\s*1\.\s+\S', full_text)
+        if m:
+            potential = full_text[m.start():]
+            if len(_re.findall(r'\n\s*\d+\.\s+', potential)) >= 3:
+                body_text = full_text[:m.start()]
+                ref_text  = potential
+            else:
+                body_text, ref_text = full_text, ""
+        else:
+            body_text, ref_text = full_text, ""
+
+    # ── Parse paragraphs ─────────────────────────────────────────────────
+    paragraphs = []
+    for para in _re.split(r'\n\s*\n', body_text.strip()):
+        para = para.strip()
+        if not para:
+            continue
+        raw_cits = _re.findall(r'\[(\d+(?:[,;\s]\d+)*)\]', para)
+        nums = sorted({int(n) for c in raw_cits for n in _re.split(r'[,;\s]+', c) if n.isdigit()})
+        paragraphs.append({"text": para, "citation_numbers": nums})
+
+    # ── Parse reference list ─────────────────────────────────────────────
+    references = {}
+    if ref_text:
+        for m in _re.finditer(r'(\d+)\.\s+(.+?)(?=\n\s*\d+\.\s|\Z)', ref_text, _re.DOTALL):
+            references[int(m.group(1))] = m.group(2).strip().replace('\n', ' ')
+
+    return paragraphs, references
+
+
+def _audit_citations_ai(client, provider, model,
+                         paragraphs: list, references: dict, style: str) -> list:
+    """Single AI call to audit ALL citations in the text.
+    Returns list of issue dicts, one per problematic citation.
+    """
+    import re as _re
+
+    # Build compact summary for AI
+    para_summary = []
+    for i, p in enumerate(paragraphs):
+        if p["citation_numbers"]:
+            para_summary.append(
+                f"P{i+1}: ...{p['text'][-200:]}  → cita {p['citation_numbers']}"
+            )
+
+    ref_list_str = "\n".join(
+        f"[{n}] {txt[:200]}" for n, txt in sorted(references.items())
+    )
+
+    if not para_summary:
+        return []
+
+    prompt = (
+        f"You are a scientific peer reviewer auditing citations in a manuscript.\n"
+        f"Citation style: {style}\n\n"
+        "For EACH citation in the paragraphs below:\n"
+        "1. Check RELEVANCE: does the cited reference actually support the claim?\n"
+        "2. Check FORMAT: is the reference formatted correctly in the stated style?\n"
+        "3. If relevance is Low or Wrong: provide an English PubMed query to find a better article.\n\n"
+        "Return ONLY valid JSON array (no markdown):\n"
+        '[\n'
+        '  {\n'
+        '    "paragraph": "P1",\n'
+        '    "citation_num": 3,\n'
+        '    "relevance": "Alta|Media|Baixa|Incorreta",\n'
+        '    "relevance_reason": "brief in Portuguese",\n'
+        '    "format_ok": true,\n'
+        '    "format_issues": ["list or empty"],\n'
+        '    "status": "OK|Aviso|Erro",\n'
+        '    "pubmed_query": "English query or empty string",\n'
+        '    "summary": "one sentence in Portuguese"\n'
+        '  }\n'
+        ']\n\n'
+        "Only include entries where status is Aviso or Erro (skip OK ones).\n\n"
+        "=== PARAGRAPHS (with their citations) ===\n"
+        + "\n".join(para_summary[:40]) +
+        "\n\n=== REFERENCE LIST ===\n"
+        + ref_list_str[:3000]
+    )
+
+    raw  = ai_call(client, provider, model, prompt, max_tokens=6000)
+    data = extract_json_from_ai(raw)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "issues" in data:
+        return data["issues"]
+    return []
+
+
+def _format_audit_report_docx(issues: list, paragraphs: list,
+                                references: dict, style: str) -> bytes:
+    """Generate Word report for citation audit."""
+    from docx import Document as _Doc
+    from docx.shared import Pt, RGBColor
+    doc = _Doc()
+    doc.add_heading("Relatório de Auditoria Científica de Citações", 0)
+    doc.add_paragraph(f"Estilo: {style}  |  Parágrafos auditados: {len(paragraphs)}  "
+                      f"|  Problemas encontrados: {len(issues)}")
+    doc.add_heading("Problemas Identificados", level=1)
+    if not issues:
+        doc.add_paragraph("Nenhum problema encontrado — todas as citações estão corretas.")
+    for iss in issues:
+        p_lbl = iss.get("paragraph", "?")
+        c_num = iss.get("citation_num", "?")
+        status = iss.get("status", "?")
+        h = doc.add_heading(f"{p_lbl} → Citação [{c_num}]  ({status})", level=2)
+        run = h.runs[0] if h.runs else h.add_run()
+        if status == "Erro":
+            run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+        elif status == "Aviso":
+            run.font.color.rgb = RGBColor(0xFF, 0x80, 0x00)
+        doc.add_paragraph(f"Relevância: {iss.get('relevance','?')}")
+        doc.add_paragraph(iss.get("relevance_reason",""))
+        if iss.get("format_issues"):
+            doc.add_paragraph("Problemas de formato:")
+            for fi in iss["format_issues"]:
+                doc.add_paragraph(fi, style="List Bullet")
+        ref_txt = references.get(c_num, "")
+        if ref_txt:
+            doc.add_paragraph(f"Referência atual: {ref_txt[:300]}")
+        if iss.get("pubmed_query"):
+            doc.add_paragraph(f"Query PubMed sugerida: {iss['pubmed_query']}")
+        sugs = iss.get("suggestions", [])
+        if sugs:
+            doc.add_paragraph("Artigos sugeridos:")
+            for s in sugs:
+                doc.add_paragraph(
+                    f"{s.get('authors',['?'])[0]} et al. {s.get('title','?')[:80]}. "
+                    f"{s.get('journal','?')} {s.get('year','?')}. PMID:{s.get('pmid','')}",
+                    style="List Bullet"
+                )
+    doc.add_heading("Lista de Referências (conforme recebida)", level=1)
+    for n, txt in sorted(references.items()):
+        doc.add_paragraph(f"[{n}] {txt}", style="List Bullet")
+    from io import BytesIO as _BIO
+    buf = _BIO(); doc.save(buf); return buf.getvalue()
+
+
+def render_revisao_tab():
+    st.markdown("### Revisão Científica")
+    api_key  = st.session_state.get("_api_key", "")
+    provider = st.session_state.get("_provider", "")
+    model    = st.session_state.get("_model", "")
 
     if not api_key:
-        st.warning("Configure a chave API na barra lateral antes de revisar.")
+        st.warning("Configure a chave API na barra lateral antes de usar.")
         return
 
-    tab_up, tab_paste = st.tabs(["Upload (PDF, Word ou Markdown)", "Colar texto"])
-    text_file   = None
-    pasted_text = ""
-    with tab_up:
-        text_file = st.file_uploader("Upload PDF, Word ou Markdown",
-                                     type=["pdf","docx","md"],
-                                     key="rev_upload")
-        if text_file: st.success(f"{text_file.name} carregado")
-    with tab_paste:
-        pasted_text = st.text_area("Cole seu texto aqui:", height=260,
-                                   placeholder="Cole o texto para revisao...",
-                                   key="rev_paste")
+    sub_audit, sub_editorial = st.tabs(
+        ["🔬 Auditoria de Citações", "📝 Revisão Editorial"])
 
-    st.divider()
+    # ── TAB: AUDITORIA DE CITAÇÕES ────────────────────────────────────────
+    with sub_audit:
+        st.markdown(
+            "Cole um texto científico já formatado (com citações inline "
+            "`[1]`, `[2]`... e lista de referências ao final). "
+            "A IA verifica se cada citação é relevante para o parágrafo, "
+            "se a formatação está correta e sugere artigos substitutos quando necessário."
+        )
 
-    col_a, col_b = st.columns([3,1])
-    with col_a:
-        st.markdown("""**O que sera revisado:**
-- Ortografia e acentuacao
-- Gramatica e concordancia
-- Estilo cientifico (voz passiva excessiva, frases longas, verbos fracos)
-- Redundancia e repeticoes
-- Coesao entre paragrafos""")
-    with col_b:
-        run_rev = st.button("Revisar texto", type="primary",
-                            use_container_width=True, disabled=not api_key)
+        col_sty, col_sp = st.columns([2, 3])
+        with col_sty:
+            audit_style = st.selectbox(
+                "Estilo bibliográfico:",
+                CITATION_STYLES,
+                key="audit_style_sel",
+            )
 
-    if run_rev:
-        main_text = ""
-        if text_file:
-            b  = text_file.read()
-            fn = text_file.name.lower()
-            if fn.endswith(".pdf"):
-                main_text = extract_text_from_pdf(b)
-            elif fn.endswith(".md"):
-                main_text = b.decode("utf-8", errors="replace")
+        # Input
+        tab_a_up, tab_a_paste = st.tabs(["Upload (PDF / DOCX / MD)", "Colar texto"])
+        audit_file, audit_pasted = None, ""
+        with tab_a_up:
+            audit_file = st.file_uploader(
+                "Upload do texto completo (com referências ao final)",
+                type=["pdf", "docx", "md"], key="audit_upload")
+            if audit_file:
+                st.success(f"{audit_file.name} carregado")
+        with tab_a_paste:
+            audit_pasted = st.text_area(
+                "Cole o texto completo (inclua a lista de referências ao final):",
+                height=320, key="audit_paste",
+                placeholder=(
+                    "Parágrafo com afirmação científica [1,2].\n\n"
+                    "Outro parágrafo com outra afirmação [3].\n\n"
+                    "REFERÊNCIAS\n"
+                    "1. Smith AB et al. Título do artigo. J Psychiatry. 2023;45:123.\n"
+                    "2. Jones CD, Garcia L. Outro artigo. Lancet. 2022;399:1234.\n"
+                    "3. ..."
+                ),
+            )
+
+        run_audit = st.button(
+            "🔬 Auditar citações", type="primary",
+            use_container_width=True, disabled=not api_key,
+            key="btn_run_audit"
+        )
+
+        if run_audit:
+            # Extract text
+            full_text = ""
+            if audit_file:
+                b = audit_file.read(); fn = audit_file.name.lower()
+                if fn.endswith(".pdf"):
+                    full_text = extract_text_from_pdf(b)
+                elif fn.endswith(".md"):
+                    full_text = b.decode("utf-8", errors="replace")
+                else:
+                    full_text = extract_text_from_docx(b)
             else:
-                main_text = extract_text_from_docx(b)
-        else:
-            main_text = pasted_text.strip()
+                full_text = audit_pasted.strip()
 
-        if not main_text:
-            st.error("Insira o texto para revisao.")
-            return
+            if not full_text:
+                st.error("Insira o texto para auditoria.")
+            else:
+                paragraphs, references = _parse_text_and_refs(full_text)
+                cited_paras = [p for p in paragraphs if p["citation_numbers"]]
 
-        try:
-            client = get_ai_client(provider, api_key)
-        except Exception as e:
-            st.error(f"Erro ao inicializar cliente IA: {e}")
-            return
+                if not references:
+                    st.warning(
+                        "Não foi possível detectar a lista de referências. "
+                        "Certifique-se de que o texto termina com uma seção "
+                        "identificada como 'Referências' ou com uma lista numerada."
+                    )
+                elif not cited_paras:
+                    st.warning(
+                        "Nenhuma citação inline encontrada. "
+                        "O texto deve conter marcações como [1], [2] ou [1,2]."
+                    )
+                else:
+                    st.info(
+                        f"Detectados: **{len(paragraphs)}** parágrafos, "
+                        f"**{len(cited_paras)}** com citações, "
+                        f"**{len(references)}** referências na lista."
+                    )
 
-        result = run_revision_pipeline(client, provider, model, main_text)
-        st.session_state["last_revision"] = result
+                    try:
+                        client = get_ai_client(provider, api_key)
+                    except Exception as e:
+                        st.error(f"Erro ao conectar IA: {e}")
+                        st.stop()
 
-    if st.session_state.get("last_revision"):
-        display_revision_results(st.session_state["last_revision"])
+                    with st.status("🔬 Auditando citações...", expanded=True) as _s:
+                        st.write(f"📋 Analisando {len(cited_paras)} parágrafos com citações...")
+                        issues = _audit_citations_ai(
+                            client, provider, model, paragraphs, references, audit_style)
+                        _s.update(label=f"✅ Auditoria concluída — {len(issues)} problema(s) encontrado(s)",
+                                  state="complete", expanded=False)
+
+                    # For each issue with pubmed_query: search for suggestions
+                    if issues:
+                        with st.status("🌐 Buscando artigos substitutos...", expanded=True) as _s2:
+                            for iss in issues:
+                                q = iss.get("pubmed_query", "").strip()
+                                if q and iss.get("status") in ("Erro", "Aviso"):
+                                    st.write(f"  PubMed: `{q[:60]}`...")
+                                    results = multi_source_search(q, max_per_source=3)
+                                    iss["suggestions"] = results[:3]
+                                else:
+                                    iss["suggestions"] = []
+                            _s2.update(label="✅ Busca concluída", state="complete",
+                                       expanded=False)
+
+                    st.session_state["last_audit"] = {
+                        "issues": issues, "paragraphs": paragraphs,
+                        "references": references, "style": audit_style,
+                        "n_cited_paras": len(cited_paras),
+                    }
+
+        # ── Display audit results ─────────────────────────────────────────
+        audit_res = st.session_state.get("last_audit")
+        if audit_res:
+            issues     = audit_res["issues"]
+            refs       = audit_res["references"]
+            paras      = audit_res["paragraphs"]
+            sty        = audit_res["style"]
+            n_cited    = audit_res["n_cited_paras"]
+            n_ok       = n_cited - len([i for i in issues if i.get("status") == "Erro"])
+            n_warn     = len([i for i in issues if i.get("status") == "Aviso"])
+            n_err      = len([i for i in issues if i.get("status") == "Erro"])
+
+            st.divider()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Parágrafos auditados", n_cited)
+            c2.metric("✅ Citações OK",  max(0, n_cited - n_err - n_warn))
+            c3.metric("⚠️ Avisos",       n_warn)
+            c4.metric("❌ Erros",        n_err)
+
+            if not issues:
+                st.success("✅ Todas as citações estão corretas e bem formatadas!")
+            else:
+                st.markdown("---")
+                for iss in issues:
+                    p_lbl = iss.get("paragraph", "?")
+                    c_num = iss.get("citation_num", "?")
+                    status = iss.get("status", "Aviso")
+                    rel    = iss.get("relevance", "?")
+                    icon   = "❌" if status == "Erro" else "⚠️"
+
+                    with st.expander(
+                        f"{icon} **{p_lbl}** → Citação **[{c_num}]** "
+                        f"— Relevância: {rel}  ({status})",
+                        expanded=(status == "Erro")
+                    ):
+                        st.markdown(f"**Diagnóstico:** {iss.get('relevance_reason','')}")
+
+                        f_issues = iss.get("format_issues", [])
+                        if f_issues:
+                            st.markdown("**Problemas de formatação:**")
+                            for fi in f_issues:
+                                st.markdown(f"- {fi}")
+
+                        ref_txt = refs.get(c_num, "")
+                        if ref_txt:
+                            st.markdown(
+                                f"<div class='ref-box'>Referência atual [{c_num}]: "
+                                f"{ref_txt[:300]}</div>",
+                                unsafe_allow_html=True
+                            )
+
+                        sugs = iss.get("suggestions", [])
+                        if sugs:
+                            st.markdown("**📚 Artigos mais adequados encontrados:**")
+                            for j, s in enumerate(sugs, 1):
+                                authors = s.get("authors", [])
+                                a_str   = authors[0] if authors else "?"
+                                if len(authors) > 1:
+                                    a_str += " et al."
+                                pmid = s.get("pmid", "")
+                                doi  = s.get("doi",  "")
+                                link = (f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                                        if pmid else
+                                        f"https://doi.org/{doi}" if doi else "")
+                                title = s.get("title", "")
+                                journal = s.get("journal", "")
+                                year    = s.get("year", "")
+                                line = f"**{j}.** {a_str}. {title[:80]}. *{journal}*. {year}."
+                                if link:
+                                    line += f" → [Ver artigo]({link})"
+                                st.markdown(line)
+                        elif iss.get("pubmed_query"):
+                            st.caption(
+                                f"Query de busca usada: `{iss.get('pubmed_query','')}`")
+
+            # Download report
+            st.divider()
+            try:
+                rpt_bytes = _format_audit_report_docx(issues, paras, refs, sty)
+                st.download_button(
+                    "📄 Baixar relatório completo (.docx)",
+                    data=rpt_bytes,
+                    file_name="auditoria_citacoes.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                    type="primary",
+                )
+            except Exception as e_rpt:
+                st.warning(f"Relatório Word não gerado: {e_rpt}")
+
+    # ── TAB: REVISÃO EDITORIAL (mantida) ─────────────────────────────────
+    with sub_editorial:
+        st.caption(
+            "Revisão ortográfica, gramatical, estilística e de redundância — "
+            "como um editor sênior de publicações científicas.")
+
+        tab_up, tab_paste = st.tabs(["Upload (PDF, Word ou Markdown)", "Colar texto"])
+        text_file, pasted_text = None, ""
+        with tab_up:
+            text_file = st.file_uploader("Upload PDF, Word ou Markdown",
+                                         type=["pdf","docx","md"], key="rev_upload")
+            if text_file:
+                st.success(f"{text_file.name} carregado")
+        with tab_paste:
+            pasted_text = st.text_area("Cole seu texto aqui:", height=260,
+                                       placeholder="Cole o texto para revisão...",
+                                       key="rev_paste")
+
+        st.divider()
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.markdown(
+                "**O que será revisado:**\n"
+                "- Ortografia e acentuação\n"
+                "- Gramática e concordância\n"
+                "- Estilo científico (voz passiva excessiva, frases longas)\n"
+                "- Redundância e repetições\n"
+                "- Coesão entre parágrafos"
+            )
+        with col_b:
+            run_rev = st.button("Revisar texto", type="primary",
+                                use_container_width=True, disabled=not api_key,
+                                key="btn_rev_editorial")
+
+        if run_rev:
+            main_text = ""
+            if text_file:
+                b = text_file.read(); fn = text_file.name.lower()
+                if fn.endswith(".pdf"):
+                    main_text = extract_text_from_pdf(b)
+                elif fn.endswith(".md"):
+                    main_text = b.decode("utf-8", errors="replace")
+                else:
+                    main_text = extract_text_from_docx(b)
+            else:
+                main_text = pasted_text.strip()
+
+            if not main_text:
+                st.error("Insira o texto para revisão.")
+            else:
+                try:
+                    client = get_ai_client(provider, api_key)
+                except Exception as e:
+                    st.error(f"Erro ao inicializar cliente IA: {e}")
+                    st.stop()
+                result = run_revision_pipeline(client, provider, model, main_text)
+                st.session_state["last_revision"] = result
+
+        if st.session_state.get("last_revision"):
+            display_revision_results(st.session_state["last_revision"])
 
 
 # =============================================================================
