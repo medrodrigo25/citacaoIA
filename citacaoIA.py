@@ -255,6 +255,39 @@ def _change_password(db: dict, username: str,
 
 def render_login_page() -> bool:
     """Gate: returns True if user is authenticated. Shows setup/login otherwise."""
+
+    # ── HUB TOKEN AUTH (portal-aluno.html → iframe) ──────────────────────────
+    # Se um token HMAC válido chegar via ?hub_token=...&hub_user=...&hub_ts=...,
+    # o aluno é autenticado automaticamente sem ver o formulário de login.
+    if not st.session_state.get("auth_user"):
+        try:
+            hub_cfg = st.secrets.get("hub_auth", {})
+            if hub_cfg.get("enabled", False):
+                import hmac as _hmac_hub, hashlib as _sha_hub, time as _time_hub
+                params    = st.query_params
+                hub_token = params.get("hub_token", "")
+                hub_user  = params.get("hub_user",  "")
+                hub_ts    = params.get("hub_ts",    "")
+                secret    = hub_cfg.get("secret", "")
+                if hub_token and hub_user and hub_ts and secret:
+                    try:
+                        ts_int = int(hub_ts)
+                        age    = _time_hub.time() - ts_int
+                        if 0 <= age <= 300:  # token válido por 5 minutos
+                            payload  = f"{hub_user}|{hub_ts}".encode()
+                            expected = _hmac_hub.new(
+                                secret.encode(), payload, _sha_hub.sha256
+                            ).hexdigest()
+                            if _hmac_hub.compare_digest(expected, hub_token):
+                                st.session_state["auth_user"] = hub_user.lower()
+                                st.session_state["auth_role"] = "user"
+                                st.session_state["hub_auth"]  = True
+                                st.query_params.clear()
+                    except (ValueError, TypeError):
+                        pass  # timestamp malformado → login normal
+        except Exception:
+            pass  # secrets não configurado → ignora
+
     if st.session_state.get("auth_user"):
         return True
 
